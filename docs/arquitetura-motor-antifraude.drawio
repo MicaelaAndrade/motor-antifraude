@@ -1,0 +1,100 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Arquitetura" id="GtctCAM7E2Q06WNI123I">
+    <mxGraphModel dx="1285" dy="603" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="banco" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Serviço interno do banco" vertex="1">
+          <mxGeometry height="80" width="120" x="40" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="transactions" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;" value="Kafka&lt;br&gt;tópico transactions" vertex="1">
+          <mxGeometry height="110" width="110" x="220" y="245" as="geometry" />
+        </mxCell>
+        <mxCell id="motor" parent="1" style="rounded=0;whiteSpace=wrap;html=1;fontStyle=1;" value="Motor de Detecção&lt;br&gt;Java + Spring" vertex="1">
+          <mxGeometry height="80" width="160" x="390" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="alerts" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;" value="Kafka&lt;br&gt;tópico alerts" vertex="1">
+          <mxGeometry height="110" width="110" x="610" y="245" as="geometry" />
+        </mxCell>
+        <mxCell id="antifraude" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Antifraude interno" vertex="1">
+          <mxGeometry height="80" width="140" x="780" y="260" as="geometry" />
+        </mxCell>
+        <mxCell id="grafana" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Prometheus e Grafana" vertex="1">
+          <mxGeometry height="60" width="90" x="250" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="redis" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Redis" vertex="1">
+          <mxGeometry height="60" width="80" x="380" y="439" as="geometry" />
+        </mxCell>
+        <mxCell id="postgres" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Postgres&lt;br&gt;de regras" vertex="1">
+          <mxGeometry height="60" width="80" x="470" y="440" as="geometry" />
+        </mxCell>
+        <mxCell id="apiregras" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="API de Regras" vertex="1">
+          <mxGeometry height="60" width="90" x="465" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="notificacao" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Serviço de notificação&lt;br&gt;retry e circuit breaker" vertex="1">
+          <mxGeometry height="80" width="140" x="595" y="420" as="geometry" />
+        </mxCell>
+        <mxCell id="push" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Push" vertex="1">
+          <mxGeometry height="50" width="80" x="870" y="389" as="geometry" />
+        </mxCell>
+        <mxCell id="email" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="E-mail" vertex="1">
+          <mxGeometry height="50" width="80" x="880" y="475" as="geometry" />
+        </mxCell>
+        <mxCell id="clientes" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Base de clientes" vertex="1">
+          <mxGeometry height="60" width="100" x="780" y="600" as="geometry" />
+        </mxCell>
+        <mxCell id="dlq" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="DLQ" vertex="1">
+          <mxGeometry height="50" width="120" x="605" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="seguranca" parent="1" style="text;html=1;whiteSpace=wrap;align=center;verticalAlign=middle;" value="Segurança: TLS/mTLS entre serviços, dados criptografados, CPF e cartão mascarados" vertex="1">
+          <mxGeometry height="30" width="880" x="40" y="140" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="banco" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="transactions">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="transactions" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="motor">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="motor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="alerts">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="alerts" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="antifraude">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="redis" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;entryX=0.194;entryY=1;entryDx=0;entryDy=0;entryPerimeter=0;" target="motor">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="postgres" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;entryX=0.75;entryY=1;entryDx=0;entryDy=0;" target="motor">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="apiregras" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="postgres">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="grafana" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;fontSize=10;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" target="motor" value="métricas">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="alerts" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="notificacao">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="notificacao" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="push">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="notificacao" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="email">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="notificacao" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;fontSize=10;" target="clientes" value="dados do cliente">
+          <mxGeometry relative="1" x="-0.1234" as="geometry">
+            <Array as="points">
+              <mxPoint x="760" y="460" />
+              <mxPoint x="760" y="530" />
+              <mxPoint x="830" y="530" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="1" source="notificacao" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=4 4;fontSize=10;" target="dlq" value="falhou de vez">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
