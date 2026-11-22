@@ -2,12 +2,13 @@ package com.mica.motor;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
+@EnableScheduling
 @SpringBootApplication
 public class MotorDeteccaoApplication {
 
-	public static void main(String[] args) {
-		SpringApplication.run(MotorDeteccaoApplication.class, args);
-	}
-
+    public static void main(String[] args) {
+        SpringApplication.run(MotorDeteccaoApplication.class, args);
+    }
 }
