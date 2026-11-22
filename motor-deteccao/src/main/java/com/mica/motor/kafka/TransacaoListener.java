@@ -43,8 +43,9 @@ public class TransacaoListener {
             if (regra.ehSuspeita(transacao)) {
                 log.warn("SUSPEITA: transação {} da conta {} quebrou a regra {}",
                         transacao.transactionId(), transacao.accountId(), regra.id());
+                          publisher.publicar(Alerta.de(transacao, regra.id()));
             }
-            publisher.publicar(Alerta.de(transacao, regra.id()));
         }
+
     }
 }
