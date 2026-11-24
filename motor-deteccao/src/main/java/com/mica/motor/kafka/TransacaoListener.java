@@ -33,17 +33,26 @@ public class TransacaoListener {
     public void consumir(String mensagem) {
         Transacao transacao = objectMapper.readValue(mensagem, Transacao.class);
 
+        if (transacao.eventId() == null || transacao.eventId().isBlank()) {
+            throw new IllegalArgumentException("Evento sem eventId");
+        }
+
         if (!idempotencia.registrar(transacao.eventId())) {
             log.info("Evento {} duplicado, ignorado", transacao.eventId());
             return;
         }
 
-        for (Regra regra : regraCache.atuais()) {
-            if (regra.ehSuspeita(transacao)) {
-                log.warn("SUSPEITA: transação {} da conta {} quebrou a regra {}",
-                        transacao.transactionId(), transacao.accountId(), regra.id());
-                publisher.publicar(Alerta.de(transacao, regra.id()));
+        try {
+            for (Regra regra : regraCache.atuais()) {
+                if (regra.ehSuspeita(transacao)) {
+                    log.warn("SUSPEITA: transação {} quebrou a regra {}",
+                            transacao.transactionId(), regra.id());
+                    publisher.publicar(Alerta.de(transacao, regra.id()));
+                }
             }
+        } catch (RuntimeException e) {
+            idempotencia.liberar(transacao.eventId());
+            throw e;
         }
     }
 }

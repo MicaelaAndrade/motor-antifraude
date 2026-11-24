@@ -1,6 +1,8 @@
 package com.mica.motor.kafka;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -73,5 +75,17 @@ class TransacaoListenerTest {
 
         verify(regra, never()).ehSuspeita(any());
         verify(publisher, never()).publicar(any(Alerta.class));
+    }
+
+    @Test
+    void liberaIdempotenciaQuandoPublicacaoFalha() {
+        when(idempotencia.registrar("ev-1")).thenReturn(true);
+        when(regra.ehSuspeita(transacao)).thenReturn(true);
+        doThrow(new IllegalStateException("broker fora"))
+                .when(publisher).publicar(any(Alerta.class));
+
+        assertThrows(IllegalStateException.class, () -> listener.consumir("json"));
+
+        verify(idempotencia).liberar("ev-1");
     }
 }
