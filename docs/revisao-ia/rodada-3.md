@@ -1,12 +1,56 @@
 # Revisão por IA — Rodada 3
 
-> ⚠️ **Relatório parcial.** O agente `caca-bugs` ainda não terminou. O resumo consolidado de N1, N2, P1, P2, P5 e N5 será escrito quando ele concluir; por enquanto vale a análise do `arquiteto`, abaixo.
-
 - **Data:** 2026-11-24
 - **Commit revisado:** `b83719b`. A mensagem é "docs: README e uso de IA", mas o commit traz as correções de código. O `README.md` revisado é a versão do disco, ainda não commitada.
 - **Objetivo:** verificar se N1, N2, P1, P2, P5 e N5 da [rodada 2](rodada-2.md) foram resolvidos, se as correções criaram problemas novos e se o `README.md` descreve corretamente o que o código faz
 - **Agentes:** `caca-bugs`, `arquiteto` e `codigo-morto`, em paralelo
-- **Observação:** os agentes não alteraram arquivos. Os testes, a cobertura e as afirmações sobre o `pom.xml` foram conferidos depois, rodando o build.
+- **Observação:** os agentes não alteraram arquivos. Os testes, a cobertura, as afirmações sobre o `pom.xml` e os achados mais graves foram conferidos depois, no código e rodando o build.
+
+## Resumo consolidado
+
+O commit troca **perda silenciosa** por **desvio para a DLQ** na maioria dos casos, o que é um avanço real. Mas a `transactions-dlt` não tem consumidor, então vários casos viraram "perda manual". A deduplicação da notificação criou uma dependência nova do Redis. O README ainda descreve o modelo antigo de idempotência e tem afirmações falsas sobre cobertura e ferramentas.
+
+### Situação dos itens da rodada 2
+
+| Item | Situação | Resumo |
+|---|---|---|
+| **N1** – alertas duplicados | ⚠️ Parcial | O `geradoEm` agora é estável e a notificação descarta repetidos no caso sequencial. Mas a deduplicação faz verificação e escrita separadas, sem atomicidade, e há corrida entre o container de `alerts` e o de `alerts-retry`. O tópico `alerts` continua recebendo duplicatas, e o "antifraude interno" não deduplica. Se o envio funcionar e o `marcarNotificado` falhar, o alerta é reenviado. |
+| **N2** – DLT não criada | ✅ Resolvido localmente / ⚠️ parcial para produção | `NewTopic` declarados. Mas `replicas(1)` e 24 partições estão fixos no código. Num cluster com `min.insync.replicas=2`, todo `send` com `acks=all` falha. Se um tópico já existir com menos partições, o boot aumenta para 24 e quebra a ordem por conta. O `alerts-dlt` e os tópicos de retry seguem os padrões do broker. |
+| **P1** – crash no meio perde evento | ⚠️ Parcial | Não perde mais em silêncio, mas **todo evento interrompido por crash ou rebalance vai para a `transactions-dlt`**: o retry dura ~3s (`FixedBackOff(1000, 3)`) e a marca `PROCESSANDO` dura 5 min. Ninguém consome essa DLT. Sem token de dono, um processamento antigo ainda ativo pode apagar ou concluir a marca de outra instância. |
+| **P2** – falha no `liberar` perde evento | ✅ Resolvido quanto à perda | O `addSuppressed` preserva o erro original e a chave órfã é `PROCESSANDO`, não `CONCLUIDO`. O evento vai para a DLQ em ~3s, então o retry não serve para nada nesse caso. Se o `concluir` falhar depois de publicar, os alertas são republicados. |
+| **P5** – NPE retentada | ⚠️ Quase resolvido | `validar()` cobre payload `null`, `eventId`, `valor`, `dataHora` e `accountId`. **Falta o `transactionId`.** Com ele nulo, o `alertaId` vira `null:<regra>` e a primeira notificação silencia as outras por 24h. `accountId` em branco passa. `RegraConfig` com `limite` nulo ainda gera NPE em toda transação. |
+| **N5** – IAE genérica não-retentável | ✅ Resolvido | `EventoInvalidoException` é classificada corretamente mesmo embrulhada. Ressalvas: a exceção está no pacote `kafka`, e não em `domain`. A `EventoEmProcessamentoException` precisaria de um backoff próprio. |
+
+### Problemas novos introduzidos por `b83719b`
+
+**Alta gravidade**
+1. **Crash ou rebalance vira DLQ de forma determinística.** O backoff de ~3s contra o TTL de 5 min, sem consumidor da `transactions-dlt`, deixa a detecção perdida na prática (`KafkaConfig.java:40`, `IdempotenciaService.java:23`).
+2. **A notificação passou a depender do Redis.** Com o Redis fora por mais de ~3s, todos os alertas vão para a `alerts-dlt` (`NotificacaoListener.java:32,37`). Isso contradiz "funcionar com serviço auxiliar fora".
+3. **Um `transactionId` nulo ou reutilizado suprime notificações reais.** O `alertaId` `null:<regra>` colide na deduplicação por 24h (`Alerta.java:17`).
+
+**Média gravidade**
+4. `concluir` e `liberar` funcionam sem token de dono (`IdempotenciaService.java:31-37`).
+5. A deduplicação da notificação tem condição de corrida e só um consumidor (a notificação) a faz.
+6. A topologia de tópicos está fixa no código: `replicas(1)`, 24 partições duplicadas no compose, o motor cria o tópico upstream `transactions` e as DLTs não têm `retention.ms` (LGPD).
+7. Um timeout do SETNX depois de o comando já ter sido executado no servidor deixa um `PROCESSANDO` órfão, e o evento vai para a DLQ.
+8. Acoplamento: a notificação, que no diagrama é um serviço separado, importa o `IdempotenciaService` do motor e compartilha o Redis dele. O `IdempotenciaService` ficou com duas responsabilidades.
+9. Mais um round-trip no Redis por evento. Somando com a `FrequenciaRegra`, são 6 round-trips por transação, cerca de 150k ops/s no pico de 25k TPS.
+
+**Baixa gravidade**
+10. O `geradoEm` passou a guardar a hora da transação. Isso impede medir a latência evento→alerta (meta de 500 ms) por esse campo.
+11. A `DltHandler` sempre diz "4 tentativas" e não loga nenhum identificador operacional (tópico, partição, offset).
+12. Capturar `Error` e chamar o Redis dentro do `catch`.
+13. Duplicações pequenas: prefixo `"notif:"`, TTL de 24h, nomes de tópicos e o número 24.
+
+### Lacunas de teste
+- Nenhum teste garante a **ordem** "publicar antes de concluir" nem "enviar antes de marcar". Uma inversão passaria nos testes.
+- Faltam testes de campos obrigatórios nulos, de falha no `concluir`, de GET `null` em `iniciar`, de `marcarNotificado`, de `jaNotificado=false` e de "gateway falha, então não marca".
+- Não há teste de integração de `KafkaConfig`/DLT com `@EmbeddedKafka`, apesar do starter no `pom.xml`.
+
+### Pendências antigas que continuam
+- **A3:** cache de regras vazio no boot marca eventos `CONCLUIDO` sem avaliar. É perda permanente, não atraso.
+- **N3/N4:** `send().get(5s)` síncrono com `max.block.ms` de 60s na thread do listener.
+- `spotbugs-exclude.xml` órfão, `maven-pmd-plugin` sem `<executions>`, `starter-validation` e starters de teste sem uso, `retrytopic=OFF`.
 
 ## Verificações feitas fora dos agentes
 
@@ -22,183 +66,306 @@
 | Comando do README (só unitários) | 75,9% | 77,5% |
 | Suíte completa (com infraestrutura) | 86,6% | 77,5% |
 
-Os números do README não batem com nenhuma das duas medições. Os 80% de desvios ficam acima do que foi medido nas duas.
-
 ### Ferramentas no `pom.xml`
-- O plugin do SpotBugs **não está** no `pom.xml`. Ele foi removido no commit `93b474c`. O README diz que o projeto usa SpotBugs.
-- O `maven-pmd-plugin` **continua** no `pom.xml` (linha 128), sem `<executions>`. O README diz que ele foi removido.
-- O `pom.xml` declara `java.version` 21 e o ambiente roda o JDK 25 (`openjdk 25.0.5`). Quem não lê Java 25 é a ferramenta rodando no JDK do ambiente, e não as classes compiladas, como o README dá a entender.
+- O plugin do SpotBugs **não está** no `pom.xml` (removido em `93b474c`).
+- O `maven-pmd-plugin` **continua** no `pom.xml` (linha 128), sem `<executions>`.
+- O `pom.xml` declara `java.version` 21. O ambiente roda o JDK 25 (`openjdk 25.0.5`).
 
-## Afirmações falsas ou imprecisas no README (até agora)
+### Achados conferidos no código
+- A marca `PROCESSANDO` tem TTL de 5 min (`IdempotenciaService.java:23`), contra `FixedBackOff(1000L, 3)` (`KafkaConfig.java:40`).
+- `RegraController.salvar` faz `repository.save(regra)` com o corpo inteiro, ou seja, um PUT parcial apaga os outros campos.
+- `NotificacaoGateway.java:22` loga `accountId`.
+- O `switch` em `RegraCache.java:41-48` precisa ser editado para cada tipo novo de regra.
 
-| Trecho do README | Situação | Evidência |
-|---|---|---|
-| "Cobertura (JaCoCo): 84% das instruções e 80% dos desvios" | ❌ Falso | Medido: 75,9%/77,5% (unitários) ou 86,6%/77,5% (suíte completa) |
-| "Ficaram de fora os controllers e a classe main" | ⚠️ Incompleto | `AlertaPublisher` e `KafkaConfig` também estão com 0% de cobertura |
-| "Análise estática: SpotBugs ..." | ❌ Falso | Não há plugin do SpotBugs no `pom.xml`, e o `spotbugs-exclude.xml` está órfão |
-| "O PMD ... foi removido" | ❌ Falso | `maven-pmd-plugin` em `pom.xml:128` |
-| "O PMD não lê as classes do Java 25" | ⚠️ Impreciso | As classes são compiladas para Java 21. Java 25 é o do ambiente |
-| "A notificação não tem idempotência própria" (Limitações) | ❌ Falso desde `b83719b` | Há dedup por `alertaId` em `NotificacaoListener.java:32-37` |
-| "`SETNX` no Redis por `eventId`, liberado em caso de falha" / "gravado com `SETNX` e TTL de 24 h" | ⚠️ Impreciso | Agora são dois estados: `PROCESSANDO` (SETNX, 5 min) e `CONCLUIDO` (SET, 24h) |
-| Link para `AI_USAGE.md` | ⚠️ Risco | O arquivo existe, mas não é rastreado pelo git. Se não for commitado junto, o link quebra |
-| Comando de testes | ⚠️ Incompleto | Correto, mas não avisa que um `./mvnw test` sem filtro roda o `contextLoads` e falha sem a infraestrutura |
+## Afirmações falsas ou imprecisas no README
 
----
+| Linha | Trecho do README | Situação | Evidência |
+|---|---|---|---|
+| 96 | "O `eventId` é gravado com `SETNX` e TTL de 24 h. Se o processamento falhar, a marca é apagada" | ❌ Falso | SETNX grava `PROCESSANDO` com TTL de 5 min. As 24h são do `SET` de `CONCLUIDO`. Em crash, a marca não é apagada e o evento vai para a DLQ |
+| 83 | "`SETNX` no Redis por `eventId`, liberado em caso de falha" | ⚠️ Desatualizado | Mesmo motivo. Não cita a deduplicação da notificação |
+| 94 | "adicionar um tipo não mexe no restante do motor" | ❌ Falso | Exige editar o `switch` em `RegraCache.java:41-48`. Contradiz a própria linha 84 |
+| 107 | "Cobertura (JaCoCo): 84% das instruções e 80% dos desvios" | ❌ Falso | Medido: 75,9%/77,5% (unitários) ou 86,6%/77,5% (completa) |
+| 107 | "Ficaram de fora os controllers e a classe main" | ⚠️ Incompleto | `AlertaPublisher` e `KafkaConfig` também estão com 0% |
+| 109 | "Análise estática: SpotBugs" | ❌ Falso | Não há plugin do SpotBugs no `pom.xml` |
+| 109 | "O PMD ... foi removido" | ❌ Falso | `maven-pmd-plugin` em `pom.xml:128` |
+| 109 | "O PMD não lê as classes do Java 25" | ⚠️ Impreciso | As classes são compiladas para Java 21. Java 25 é o do ambiente |
+| 118 | "logs sem dados pessoais" | ❌ Falso | `NotificacaoGateway.java:22` loga `accountId`. As DLTs guardam o payload inteiro, sem retenção definida |
+| 132 | "A notificação não tem idempotência própria" | ❌ Desatualizado | Há deduplicação por `alertaId` em `NotificacaoListener.java:32-37` (não atômica e usando o serviço do motor) |
+| 131 | "Se o Postgres estiver fora na subida, nada é avaliado até ele voltar" | ⚠️ Atenua o problema | Os eventos são marcados `CONCLUIDO` e nunca avaliados: perda permanente |
+| 82 | "Funcionar com serviço auxiliar fora: Feito" | ⚠️ Exagerado | Redis fora manda transações e notificações para as DLQs. Postgres fora no boot perde eventos |
+| 98 | "nenhum alerta some" | ⚠️ Exagerado | RF=1 faz `acks=all` equivaler a `acks=1`. Eventos na `transactions-dlt` não geram alerta. O envio trava a partição por até ~65s |
+| 5, 12, 81, 92 | "Antifraude interno" como consumidor de `alerts` | ⚠️ Impreciso | Não existe no código. Só a notificação consome `alerts` |
+| 17 | "`transactions` (24 partições, chave `accountId`)" | ⚠️ Impreciso | A chave é do produtor externo. O próprio exemplo da linha 50 publica **sem chave**, então a ordem por conta não vale na demo |
+| 19 | Redis para "idempotência por `eventId` e janelas deslizantes" | ⚠️ Incompleto | Também guarda a deduplicação da notificação (`notif:`) |
+| 70 | Demonstração 1: "`PUT /regras/VALOR_ALTO` com `limite` 5000" | ⚠️ Enganoso | O PUT substitui a entidade inteira. Com só `limite`, a regra fica `ativa=false` e `tipo=null`. Reenviar `ev-1` é ignorado por 24h: é preciso trocar o `eventId` |
+| 100 | "Falha passageira é tentada 3 vezes" | ⚠️ Ambíguo | São 3 novas tentativas, 4 execuções no total. Não cita que "em processamento" vai para a DLQ em ~3s |
+| 64 | Comando de testes | ⚠️ Incompleto | Correto, mas não avisa que `./mvnw test` sem filtro precisa da infraestrutura |
+| 110, 147 | Link para `AI_USAGE.md` | ⚠️ Risco | O arquivo não é rastreado pelo git. Se não for commitado junto, o link quebra |
 
-## Relatório completo do agente codigo-morto
+**Verdadeiras:** Demonstração 2 (4 tentativas e `alerts-dlt`), Demonstração 3 (JSON quebrado vai para `transactions-dlt`), Demonstração 4 (um alerta por regra no reenvio sequencial), curls do `PUT /regras` (path, método e campos batem), caminho `/opt/kafka/bin` e serviços do compose.
 
-### Rodada 3: código sem uso, duplicação e conferência do README (motor-deteccao)
+**Limitações que faltam no README:** `transactions-dlt` e `alerts-dlt` sem consumidor nem replay; crash leva à DLQ; Redis como ponto único de falha do motor e da notificação; duplicatas em `alerts` para outros consumidores; PUT de regras substitui a entidade e uma configuração inválida derruba a detecção; tópicos com RF 1 fixo; falso positivo da `FrequenciaRegra` em replay; `/simulacao` sem `@Profile`.
 
-Não alterei nenhum arquivo. Não tinha shell, então não rodei git nem o build. Separei o que é novo do que é pré-existente usando a lista de mudanças de b83719b que você me passou.
+## Prioridade sugerida
+1. **Fechar o ciclo do `PROCESSANDO`:** token de dono e "assumir após rebalance", ou backoff maior que o TTL só para `EventoEmProcessamentoException`. Criar reprocessador, métrica e alarme da `transactions-dlt`.
+2. **Notificação:** fail-open quando o Redis cair, lock atômico (`SET NX ENVIANDO` antes de enviar) e deduplicação própria, sem importar o `IdempotenciaService` do motor.
+3. **Validar `transactionId` e a `RegraConfig`** (DTO + `@Valid`, PUT sem apagar campos).
+4. **Externalizar partições e RF** por ambiente.
+5. **Corrigir o README:** linhas 94, 96, 107, 109, 118 e 132 primeiro.
 
-Um ponto antes de tudo: segundo o git status do início da sessão, o README.md está modificado e ainda não foi commitado. O AI_USAGE.md e o docs/revisao-ia/ não são rastreados pelo git. O texto do README que conferi é o que está no disco, não o que está em b83719b.
-
----
-
-#### TAREFA 1: código sem uso, sobras e duplicação
-
-##### 1.1 O que você citou e continua em uso (não é código morto)
-
-- **`IdempotenciaService.liberar()`** (`src/main/java/com/mica/motor/idempotencia/IdempotenciaService.java:35-37`)
-  - Ainda é necessário. É chamado em `kafka/TransacaoListener.java:58` e testado em `IdempotenciaServiceTest.java:60-63` e `TransacaoListenerTest.java:100,109`.
-  - Sem ele, a marca `PROCESSANDO` fica no Redis por 5 minutos (`IdempotenciaService.java:23`). Aí cada nova tentativa daria `EventoEmProcessamentoException`, e com as 3 tentativas a 1s de intervalo (`KafkaConfig.java:40`) o evento iria para a DLT.
-  - Com o `liberar`, a nova tentativa começa limpa. O `liberar` só deixaria de ser necessário se o backoff passasse a ser maior que o TTL de 5 minutos.
-- **Imports de `IllegalArgumentException`/`IllegalStateException`:** não existem. As duas classes são de `java.lang`, então não precisam de import.
-  - `IllegalArgumentException` não aparece mais no `KafkaConfig`: `KafkaConfig.java:43` usa só `JacksonException` e `EventoInvalidoException`. O único uso restante é `regras/RegraCache.java:48`, que é pré-existente e é capturado pelo `catch (Exception)` da linha 36.
-  - `IllegalStateException` continua em uso em `AlertaPublisher.java:27,29`, `NotificacaoGateway.java:21` e nos testes.
-- **`RegraCache` em `TransacaoListenerTest`:** é usado. O import fica em `TransacaoListenerTest.java:18`, e a classe é usada como variável local na linha 42 (`mock(RegraCache.class)`) e no construtor na linha 49.
-- **`Instant` em `domain/Alerta.java:4`:** é usado como tipo do campo `geradoEm` (linha 12). A mudança foi só no valor, que agora é `t.dataHora()` na linha 19.
-- **`EventoInvalidoException` e `EventoEmProcessamentoException` (novas):** as duas são usadas. A primeira aparece em `TransacaoListener.java:68,71` e `KafkaConfig.java:43`. A segunda aparece em `TransacaoListener.java:43`. As duas são testadas.
-- **`jaNotificado` e `marcarNotificado` (novos):** os dois são usados em `NotificacaoListener.java:32,37`.
-- **Imports dos arquivos novos ou alterados:** nenhum está sobrando. Conferi `IdempotenciaService`, `TransacaoListener`, `KafkaConfig` (`NewTopic`, `TopicBuilder`, `TopicPartition` etc.), `NotificacaoListener` (`JacksonException` na linha 28), `Alerta` e os três testes alterados. Por exemplo, `assertEquals` e `anyString` em `TransacaoListenerTest.java:3,6` são usados nas linhas 101 e 113-114.
-
-##### 1.2 Duplicação e constantes repetidas
-
-**Novos (b83719b):**
-1. **Prefixo `"notif:"` duplicado** em `IdempotenciaService.java:40` e `:44`. Já o `"evento:"` está centralizado em `chave()` na linha 48. Falta o equivalente para a notificação, algo como `chaveNotif()`.
-2. **TTL de 24h duplicado** em `IdempotenciaService.java:32` e `:44` (`Duration.ofHours(24)`). Os TTLs de 5 minutos (linha 23) e de 24h poderiam virar constantes.
-3. **As constantes `PROCESSANDO`/`CONCLUIDO` (`IdempotenciaService.java:12-13`) são package-private, mas o teste repete os literais.** O teste está no mesmo pacote, mas usa as strings direto em `IdempotenciaServiceTest.java:35,41,42,48,49,56`. O mesmo vale para `"evento:ev-1"` (linhas 35-62).
-4. **O nome `CONCLUIDO` aparece duas vezes:** como a constante String da linha 13 e como o valor do enum `Inicio.CONCLUIDO` da linha 10. Funciona, mas a linha 28 (`CONCLUIDO.equals(atual) ? Inicio.CONCLUIDO`) fica ambígua para quem lê.
-5. **Nomes de tópico espalhados, sem uma constante comum:**
-   - `"transactions"`: `KafkaConfig.java:21` (novo) e `TransacaoListener.java:32`.
-   - `"alerts"`: `KafkaConfig.java:31` (novo), `AlertaPublisher.java:24` e `NotificacaoListener.java:29`.
-   - `"transactions-dlt"` escrito por extenso em `KafkaConfig.java:26` (novo), enquanto a linha 37 do mesmo arquivo monta o mesmo nome com `registro.topic() + "-dlt"`. Ou seja, o sufixo `-dlt` está definido duas vezes no mesmo arquivo. Além disso, o sufixo de `alerts-dlt` é implícito, vem do padrão do `@RetryableTopic`.
-6. **`.replicas(1)` repetido três vezes** em `KafkaConfig.java:21,26,31` (novo).
-7. **O número de partições, 24, aparece em dois lugares:** `KafkaConfig.java:17` (`PARTICOES = 24`, novo) e `docker-compose.yml:14` (`KAFKA_NUM_PARTITIONS: 24`, pré-existente).
-   - Hoje o valor do compose só vale para tópicos criados automaticamente que não têm `NewTopic`: `alerts-dlt` e os `alerts-retry-*`.
-   - Observação: o `@RetryableTopic` cria esses tópicos com a configuração padrão dele, e não com `PARTICOES`, então a contagem de partições pode não bater com a de `alerts`. É o mesmo número em dois lugares, sem garantia de que continuem iguais.
-8. **O número de tentativas, 4, aparece duas vezes:** em `NotificacaoListener.java:28` (`attempts = "4"`) e no texto do log da linha 43 ("depois de 4 tentativas").
-
-**Pré-existentes (continuam):**
-- **IDs de regra:** `"VALOR_ALTO"`/`"FREQUENCIA"` estão em `RegraCache.java:43-44`, `ValorAltoRegra.java:16` e `FrequenciaRegra.java:21`.
-- **Fixture de `Alerta`:** repetida em `NotificacaoGatewayTest.java:14-15` e `NotificacaoListenerTest.java:23-24`.
-- **Fixture de `Transacao`:** repetida em `TransacaoListenerTest.java:34-35,119-120`, `ValorAltoRegraTest.java:16-17` e `FrequenciaRegraTest.java:33-34`.
-
-##### 1.3 Validação de campos duplicada?
-
-Não há duplicação. `TransacaoListener.validar` (linhas 66-73, novo) é o único lugar que valida. O Grep por `jakarta.validation`, `@Valid`, `@NotNull` e `@NotBlank` não encontra nada no projeto, e `domain/Transacao.java` não tem anotações. As regras não checam nulos (`ValorAltoRegra.java:21`, `FrequenciaRegra.java:27`), porque contam com o `validar`.
-
-Duas observações sobre o código novo:
-- **Falta de teste:** só o eventId nulo é testado (`TransacaoListenerTest.java:118-125`). Os casos de `valor`, `dataHora` e `accountId` nulos e de eventId em branco não têm teste. Isso confere com o JaCoCo, que mostra 5 desvios não cobertos em `TransacaoListener`.
-- **Mensagem duplicada:** as duas mensagens de erro de `validar` (linhas 68 e 71) repetem a montagem `"Evento ..."`, também usada em `EventoEmProcessamentoException.java:6`. É pequeno.
-
-##### 1.4 `logging.level.org.springframework.kafka.retrytopic=OFF`
-
-- Continua em `src/main/resources/application.properties:15` (pré-existente).
-- Ainda tem efeito, porque o `@RetryableTopic` continua em `NotificacaoListener.java:28`. Mas desliga **todo** o log do retry topic, inclusive erros.
-- Com o `exclude = JacksonException.class` (novo), um JSON inválido em `alerts` vai direto para a DLT. O único registro disso é o `log.error` sem payload da linha 43.
-- Recomendo `WARN` no lugar de `OFF`.
-
-##### 1.5 Outras propriedades em application.properties
-
-Tudo é lido. `spring.kafka.consumer.group-id` (linha 12) é usado pelo `TransacaoListener`, que não define `groupId` próprio. As linhas 17-18 (`acks=all`, `enable.idempotence=true`) continuam sendo redundantes, porque já são o padrão do cliente Kafka. Isso já foi apontado na rodada 2.
-
-##### 1.6 Itens da rodada 2: continuam lá?
-
-| Item | Situação |
-|---|---|
-| `spotbugs-exclude.xml` órfão (`/workspaces/motor-antifraude/motor-deteccao/spotbugs-exclude.xml`) | **Continua.** Nada aponta para ele: o Grep fora de `target/` só encontra os relatórios de revisão. |
-| `spring-boot-starter-validation` (`pom.xml:49-52`) e `spring-boot-starter-validation-test` (`pom.xml:93-97`) | **Continuam sem uso.** Não há nenhuma ocorrência de `jakarta.validation` nem `@Valid`. |
-| Starters de teste sem uso: `actuator-test` (`pom.xml:73-77`), `data-jpa-test` (78-82), `data-redis-test` (83-87), `kafka-test` (88-92), `webmvc-test` (98-102) | **Continuam.** Não há `@EmbeddedKafka`, `@WebMvcTest`, `@DataJpaTest` nem `@DataRedisTest`. O único teste com Spring é `@SpringBootTest` em `MotorDeteccaoApplicationTests.java:6`. Se forem removidos, mantenha um starter que traga JUnit e Mockito. |
-| `HELP.md` (`/workspaces/motor-antifraude/motor-deteccao/HELP.md`) | **Continua no disco, mas está em `.gitignore:1`**, então não vai para o repositório. Isso é só limpeza local. |
-| `MotorDeteccaoApplicationTests.contextLoads()` vazio (`MotorDeteccaoApplicationTests.java:9-11`) | **Continua.** Precisa da infraestrutura no ar. |
-| **Novo, achado nesta rodada:** `maven-pmd-plugin` (`pom.xml:126-134`) | Não tem `<executions>`, então não roda no build. É configuração morta e contradiz o README (veja 2.4). |
 
 ---
 
-#### TAREFA 2: conferência do README (TESTES, BUILD, FERRAMENTAS)
+## Relatório completo do agente caca-bugs
 
-##### 2.1 O comando `./mvnw test -Dtest='*RegraTest,IdempotenciaServiceTest,TransacaoListenerTest,RegraCacheTest,Notificacao*Test'` (README.md:64)
+### Revisão rodada 3: motor-deteccao, correções do commit b83719b
 
-- **Todos os padrões casam com classes que existem:**
-  - `*RegraTest` casa com `ValorAltoRegraTest` e `FrequenciaRegraTest`. Ele **não** casa com `RegraCacheTest`, que termina em `CacheTest`, e por isso esse teste aparece listado à parte.
-  - `IdempotenciaServiceTest`, `TransacaoListenerTest` e `RegraCacheTest` casam com o nome exato.
-  - `Notificacao*Test` casa com `NotificacaoGatewayTest` e `NotificacaoListenerTest`.
-- **Fica de fora só o `MotorDeteccaoApplicationTests`** (o padrão termina em `Tests`). É o `@SpringBootTest` que precisa de Postgres, Redis e Kafka. Excluir ele é proposital e está correto.
-- **Nenhum dos testes incluídos precisa de Docker.** Todos usam só Mockito.
-- Os `target/surefire-reports` têm exatamente essas 7 classes e 26 casos: 6 de Idempotencia, 7 de TransacaoListener, 4 de RegraCache, 3 de ValorAlto, 2 de Frequencia, 2 de NotificacaoListener e 2 de NotificacaoGateway.
-- **Imprecisões:**
-  - O README não avisa que um simples `./mvnw test`, sem o `-Dtest`, roda o `contextLoads` e falha sem a infraestrutura.
-  - A rodada 2 diz "19 testes", e hoje são 26. Não é erro do README, mas as contagens nos relatórios de revisão ficaram desatualizadas.
-- O comentário `# relatório: target/site/jacoco/index.html` (README.md:65) está correto, porque o `report` está ligado à fase `test` (`pom.xml:117-123`).
+Não alterei nenhum arquivo e não executei build, testes nem git. O que digo sobre o comportamento do spring-kafka, do Kafka e do Redis vem de conhecimento das bibliotecas, sem execução.
 
-##### 2.2 "Unitários: regras (incluindo o limite exato), idempotência, listener (...), cache de regras (...) e notificação" (README.md:106)
-
-| Afirmação | Teste | Situação |
-|---|---|---|
-| regras, limite exato | `ValorAltoRegraTest.exatamenteNoLimiteNaoEhSuspeita` (:26). A fronteira da frequência está em `FrequenciaRegraTest` (:38, :44) | OK |
-| idempotência | `IdempotenciaServiceTest` (6 testes) | OK. Falta testar `marcarNotificado` e `jaNotificado == false` |
-| listener: publica só quando suspeita | `publicaAlertaEConcluiQuandoSuspeita` (:53) e `naoPublicaQuandoNaoSuspeitaMasConclui` (:64) | OK |
-| listener: ignora duplicado | `ignoraEventoJaConcluido` (:75) | OK. O termo "duplicado" agora significa "já concluído" |
-| listener: libera a marca quando a publicação falha | `liberaENãoConcluiQuandoPublicacaoFalha` (:93) | OK. O nome do método tem um caractere não ASCII ("ã"), diferente dos outros testes |
-| cache: Postgres fora do ar | `RegraCacheTest.postgresForaDoArMantemUltimasRegras` (:54) | OK |
-| cache: tipo inválido | `tipoDesconhecidoNaoDerrubaOMotor` (:66) | OK |
-| notificação | `NotificacaoGatewayTest` e `NotificacaoListenerTest` | OK |
-
-**O README está incompleto, e não errado:** não cita testes que existem.
-- `eventoPelaMetadeFalhaEmVezDeSumir` (:85)
-- `falhaAoLiberarNaoEscondeOErroOriginal` (:105)
-- `eventoSemIdEhInvalido` (:118)
-- `NotificacaoListenerTest.naoEnviaDeNovoAlertaRepetido` (:46)
-
-**Falsas fora da seção de testes, mas causadas pelo b83719b:**
-- **README.md:132**, "A notificação não tem idempotência própria": é **falso** agora. A deduplicação por `alertaId` existe em `NotificacaoListener.java:32-37` e `IdempotenciaService.java:39-45`. A parte "nem circuit breaker" continua verdadeira.
-- **README.md:83** ("`SETNX` no Redis por `eventId`, liberado em caso de falha") e **README.md:96** ("O `eventId` é gravado com `SETNX` e TTL de 24 h"): são **imprecisas**. Agora são dois estados: `PROCESSANDO`, com TTL de 5 minutos via `setIfAbsent` (`IdempotenciaService.java:23`), e `CONCLUIDO`, com TTL de 24h gravado por `SET` (linha 32). O TTL de 24h não vem do SETNX.
-- **README.md:96**, "permite que quem consome o alerta descarte repetidos": é verdadeira e já está implementada, mas não diz que ela existe.
-
-##### 2.3 "Cobertura (JaCoCo): 84% das instruções e 80% dos desvios" (README.md:107)
-
-- **É falsa em relação ao relatório que está no repositório.** O rodapé de `target/site/jacoco/index.html` mostra "182 of 754" instruções perdidas, ou seja, **75%**, e "9 of 40" desvios perdidos, ou seja, **77%**. A soma das linhas de `target/site/jacoco/jacoco.csv` dá o mesmo resultado: 572 de 754 e 31 de 40.
-- **O relatório parece atual, e não velho.** Ele já inclui as classes de b83719b: `IdempotenciaService.Inicio`, `EventoEmProcessamentoException` e `KafkaConfig` com 6 métodos, que são o construtor, os 3 beans `NewTopic`, o `errorHandler` e o lambda. Também bate com os 26 casos do surefire. O mais provável é que **84%/80% sejam de uma medição anterior** a b83719b. O KafkaConfig cresceu com 65 instruções não cobertas, e isso puxou a média para baixo.
-- **"Ficaram de fora os controllers e a classe main" está incompleto.** Também ficaram com 0% o `AlertaPublisher` (45 instruções) e o `KafkaConfig` (65), que juntos somam mais instruções perdidas que os controllers e a main (43).
-- **Ressalva:** como não tenho git, não sei os horários dos arquivos. A conclusão de que o relatório está atual vem da coerência entre o conteúdo do relatório e o código-fonte.
-
-##### 2.4 "Análise estática: SpotBugs; os avisos EI_EXPOSE_REP ... foram filtrados. O PMD não lê as classes do Java 25 ... e foi removido." (README.md:109)
-
-- **"SpotBugs" é falso.** Não há plugin SpotBugs no `pom.xml`: o Grep por "spotbugs" no pom não encontra nada, e o commit 93b474c se chama "removido spotbugs suporte". O filtro de EI_EXPOSE_REP só existe no `spotbugs-exclude.xml`, que está órfão.
-- **"O PMD foi removido" é falso.** O `maven-pmd-plugin` 3.26.0 continua em `pom.xml:126-134`, com `failOnViolation=false` e sem `<executions>`. Ele só roda se alguém chamar `mvn pmd:check` à mão.
-- O README descreve o contrário do pom: diz que o SpotBugs ficou e o PMD saiu, mas no pom o PMD ficou e o SpotBugs saiu.
-- **"classes do Java 25" é impreciso.** O pom declara `<java.version>21</java.version>` (`pom.xml:30`), igual ao README.md:18 e :26. Se o problema era o JDK 25 do ambiente rodando a ferramenta, o texto deveria dizer isso, porque as classes são compiladas para Java 21. Não consegui confirmar a versão do JDK do ambiente.
-
-##### 2.5 Menção a `AI_USAGE.md` (README.md:110 e :147)
-
-O arquivo existe em `/workspaces/motor-antifraude/AI_USAGE.md`. Mas segundo o git status ele **não é rastreado** (`?? ../AI_USAGE.md`), assim como `docs/revisao-ia/`. Se o README for commitado sem ele, o link fica quebrado no repositório.
+**Resumo:** o commit troca **perda silenciosa** por **desvio para a DLQ** na maioria dos casos. Isso é um avanço real. Mas ainda há quatro problemas sérios:
+- Depois de um crash, o evento vai para a `transactions-dlt` de forma determinística, e ninguém consome esse tópico.
+- A notificação passou a depender do Redis.
+- A deduplicação da notificação não é atômica.
+- O README descreve o modelo antigo de idempotência.
 
 ---
 
-##### Arquivos relevantes
-- /workspaces/motor-antifraude/README.md
-- /workspaces/motor-antifraude/motor-deteccao/pom.xml
-- /workspaces/motor-antifraude/motor-deteccao/spotbugs-exclude.xml
+#### TAREFA 1: Situação de N1, N2, P1, P2, P5 e N5
+
+##### P1 – Crash no meio do processamento: **PARCIAL**
+`TransacaoListener.java:38-45`, `IdempotenciaService.java:21-29`, `KafkaConfig.java:40`
+
+- **O que foi resolvido:** a perda silenciosa. A chave fica em `PROCESSANDO` por 5 min, a nova entrega recebe `EM_PROCESSAMENTO` e lança `EventoEmProcessamentoException`. `Error` agora também é capturado (linha 56).
+- **Por que é parcial:**
+  - **Crash vira DLQ sempre.** Sequência:
+    1. O pod sofre SIGKILL ou OOM. Também vale para um deploy em que o grace period do k8s, de 30s, mata o processo no meio de um lote de 500 registros: o `stopImmediate=false` padrão tenta terminar o lote.
+    2. A partição é reatribuída em cerca de 45s (`session.timeout.ms`).
+    3. As 4 execuções (`FixedBackOff(1000L, 3)`, cerca de 3s) caem todas em `EM_PROCESSAMENTO`, porque 3s é muito menos que o TTL de 300s.
+    4. O registro vai para a `transactions-dlt` e o offset é commitado.
+  - Isso não é perda técnica, mas é **perda de detecção na prática**: nada consome a `transactions-dlt` e não existe replay. Também não é "desvio raro": é o comportamento garantido em todo crash.
+- **Processamento que dura mais de 5 min:** é possível no pior caso.
+  - N4 continua aberto: até 65s por alerta (`max.block.ms` + `get(5s)`).
+  - Cada um dos 4 comandos da `FrequenciaRegra` pode esperar o timeout de comando do Lettuce, que é de 60s por padrão.
+  - Esse limite coincide com o `max.poll.interval.ms` de 300s. Cenário:
+    1. A instância A excede o tempo e é expulsa do grupo.
+    2. A instância B recebe a partição. Se a chave já expirou, o `SETNX` funciona (`NOVO`) e B **processa em paralelo** com A. Resultado: alertas duplicados em `alerts`.
+    3. Se A então falha, o `liberar()` dela (`IdempotenciaService.java:35-37`) **apaga a chave `PROCESSANDO` de B**, porque não há token de dono. Uma terceira entrega pode rodar ao mesmo tempo.
+  - O mais comum é o lote estourar os 300s antes de algum registro estourar 5 min. Aí B vê `PROCESSANDO` e manda para a DLQ um evento que A ainda pode concluir. Resultado: o mesmo evento fica processado **e** na DLQ.
+- **Correção sugerida:**
+  1. Gravar um token de dono (instância + UUID) no `PROCESSANDO`. Fazer `concluir` e `liberar` como compare-and-set ou compare-and-delete via script Lua.
+  2. Na `EM_PROCESSAMENTO` vista por um novo dono depois de rebalance, **assumir** o evento em vez de mandar para a DLQ. Duplicata é aceitável, porque há dedup por `alertaId`; perda não é.
+  3. Alternativa: TTL curto (30–60s) renovado durante o processamento, mais `handler.setBackOffFunction(...)` com backoff maior que o TTL só para `EventoEmProcessamentoException`. A função recebe a `ListenerExecutionFailedException`, então é preciso desembrulhar a causa.
+
+##### Corrida entre SETNX e GET em `iniciar()`: **benigna, mas mal modelada**
+`IdempotenciaService.java:27-28`
+
+- **GET devolve null:** se a chave expira ou é apagada por um `liberar` entre o SETNX e o GET, o GET devolve `null`, que vira `EM_PROCESSAMENTO`. A próxima tentativa, 1s depois, faz o SETNX funcionar (`NOVO`). Custa só 1s de retry.
+- **Caso pior (média):** o SETNX é executado no servidor, mas o cliente dá timeout. A exceção é retentável, e as 3 tentativas seguintes veem o próprio `PROCESSANDO` órfão. O evento vai para a DLQ por causa de um soluço de rede.
+- **Correção:** script Lua único (SET NX ou GET), e tratar `null` como "tentar o SETNX de novo" dentro do próprio `iniciar`.
+- **Testes:** `IdempotenciaServiceTest` não cobre o GET `null`.
+
+##### P2 – Falha do Redis no `catch`: **RESOLVIDO quanto à perda silenciosa, PARCIAL no conjunto**
+`TransacaoListener.java:56-63`
+
+- **O que foi resolvido:**
+  - O `addSuppressed` preserva o erro original. O teste `falhaAoLiberarNaoEscondeOErroOriginal` confirma.
+  - A chave órfã agora é `PROCESSANDO`, e não "concluído", então o evento não é mais descartado.
+- **O que continua:**
+  - As 3 tentativas restantes viram `EM_PROCESSAMENTO`, e o evento vai para a DLQ em cerca de 3s. O retry não serve para nada nesse caso.
+  - O `catch` interno (linha 59) só pega `RuntimeException`. Um `Error` vindo do `liberar` substitui o original (baixa).
+- **Falha do `concluir` depois de publicar** (linha 55, Redis fora):
+  1. O `catch` chama `liberar`. Se o Redis voltou, a chave some e o retry **republica todos os alertas**. Se não voltou, a chave fica em `PROCESSANDO` e o evento vai para a DLQ, com os alertas já publicados.
+  2. Em ambos os casos há duplicata em `alerts`. A dedup da notificação cobre o cliente, com as ressalvas de N1. O **antifraude interno não tem dedup** no código: depende do consumidor externo usar o `alertaId`.
+  3. Um replay da DLQ republica os alertas de novo.
+
+##### N1 – Alertas duplicados: **PARCIAL**
+`NotificacaoListener.java:32-37`, `Alerta.java:15-19`
+
+- **O que foi resolvido:**
+  - `geradoEm` agora é estável. O payload repetido é idêntico byte a byte.
+  - A notificação descarta o repetido no caso sequencial.
+- **O que não foi resolvido:**
+  - **Check-then-act não atômico.** Cenário: a cópia 1 do alerta falha no gateway e vai para `alerts-retry`. O retry do motor publica a cópia 2 em `alerts`. Os containers dos tópicos de retry são **separados** do container principal, então as duas cópias rodam em paralelo. As duas veem `jaNotificado=false` e enviam: push duplicado.
+  - **`enviar` funciona e `marcarNotificado` falha** (linha 37): a exceção dispara o `@RetryableTopic`, e o reenvio manda push de novo. O at-least-once é inerente aqui. Só uma chave de idempotência no provedor (o `alertaId`) resolve.
+  - **Redis fora:** `jaNotificado` lança `RedisConnectionFailureException` (retentável). São 4 tentativas com backoff de 1s padrão e depois `alerts-dlt`. **Toda notificação vai para a DLT** durante uma queda de mais de cerca de 3s. Isso é uma dependência nova (ver Tarefa 2).
+  - **TTL de 24h em `notif:`:** um replay de `alerts` ou `alerts-dlt` depois de 24h reenvia.
+  - **Duplicatas continuam publicadas em `alerts`.** O motor não registra quais alertas já confirmou (a sugestão 2 da rodada 2 não foi feita).
+- **Correção sugerida:**
+  - `SETNX notif:<id> ENVIANDO` com TTL curto antes de enviar e `SET ENVIADO` depois. Se o lock for de outro, lançar retentável.
+  - Passar o `alertaId` como idempotency key ao provedor.
+  - Fail-open na checagem se o Redis cair: preferir duplicata a não notificar.
+
+##### N2 – DLQ inexistente: **RESOLVIDO localmente, PARCIAL para produção**
+`KafkaConfig.java:19-32`
+
+- **Local:** o `transactions-dlt` agora é declarado. No compose (`KAFKA_NUM_PARTITIONS: 24`, uma réplica), os valores batem e não há conflito.
+- **O que continua aberto:**
+  - O `KafkaAdmin` não é fatal por padrão. Com o broker fora na subida, ou sem ACL de CREATE (comum em produção), ele só loga e segue. O cenário N2 volta se `auto.create` estiver desligado.
+  - **`replicas(1)` fixo.** Num cluster com `min.insync.replicas=2`, um tópico com RF 1 faz **todo** `send` com `acks=all` falhar (`NOT_ENOUGH_REPLICAS`), tanto em `alerts` quanto em `transactions-dlt`. Resultado: o loop infinito do N2 volta. Em produção, RF 1 também significa perder dados se um disco falhar.
+  - **Tópico que já existe com outra configuração.** O RF não é alterado. Se existir com **menos** partições, o `KafkaAdmin` **aumenta** para 24 no boot. Isso muda o mapeamento `accountId` → partição e quebra a ordem por conta durante a transição. Se existir com mais, ele só loga.
+  - `alerts-retry*` e `alerts-dlt` ficam com os defaults do broker, o que é inconsistente com os 24/1 explícitos.
+- **Correção:** externalizar partições e RF em properties (RF 3 em produção) e criar os tópicos via IaC/GitOps, não pela aplicação.
+
+##### P5 – Exceções de dado retentadas à toa: **PARCIAL**
+`TransacaoListener.java:66-73`
+
+- **O que foi resolvido:**
+  - Payload `"null"`: o `readValue` devolve `null`, que gera `EventoInvalidoException` e vai direto para a DLT.
+  - `valor`, `dataHora` e `accountId` nulos também vão direto para a DLT.
+- **Onde ainda pode dar erro:**
+  - **`transactionId` não é validado.**
+    - Na `FrequenciaRegra.java:30`, `zset.add(chave, null, ...)` faz o Spring Data Redis recusar o valor nulo com `IllegalArgumentException`, que é retentável: 4 execuções e depois DLQ, republicando o alerta de VALOR_ALTO a cada vez.
+    - O `alertaId` vira `"null:VALOR_ALTO"` (ver Tarefa 2).
+  - **`accountId` em branco ("")** passa. A chave `freq:` fica compartilhada por todas essas transações e gera falso positivo de frequência.
+  - **Configuração de regra com nulos** (veio de antes, mas é a NPE mais grave):
+    - `PUT /regras/VALOR_ALTO` sem `limite` cria `ValorAltoRegra(null)`. Em **toda** transação, `compareTo(null)` (`ValorAltoRegra.java:21`) lança NPE retentável e a transação vai para a DLQ. Uma única chamada à API derruba toda a detecção.
+    - FREQUENCIA sem `janelaSegundos`/`limite` lança NPE em `RegraCache.criar` (linhas 46-47). O `catch` na linha 36 congela todas as atualizações de regra.
+- **Correção:**
+  - Validar `transactionId` e usar `isBlank` em `accountId`.
+  - Validar a `RegraConfig` na API (`@Valid`, DTO).
+  - Ignorar só a regra inválida no `RegraCache`, não a lista inteira.
+
+##### N5 – Classificação das não-retentáveis: **RESOLVIDO, com ressalva**
+`KafkaConfig.java:43`, `NotificacaoListener.java:28`
+
+- **Resolvido:**
+  - A `IllegalArgumentException` saiu da lista. A `EventoInvalidoException` só é lançada em `validar()`.
+  - Embrulhada em `ListenerExecutionFailedException`, ela continua classificada como não-retentável, porque o classificador do `DefaultErrorHandler` percorre as causas.
+  - No `@RetryableTopic`, o resolver desembrulha a `ListenerExecutionFailedException`, então o `exclude = JacksonException` funciona.
+- **Ressalvas:**
+  - Uma `JacksonException` vinda do `writeValueAsString` do `AlertaPublisher` (linha 21) também vai direto para a DLT. Isso é aceitável.
+  - **A `EventoEmProcessamentoException` deveria ter política própria:** backoff maior que o TTL, ou assumir o evento (ver P1). Com o 1s × 3 atual, ela é praticamente uma "não-retentável que demora 3s".
+
+##### Os testes cobrem os novos caminhos?
+- `TransacaoListenerTest`:
+  - `publicaAlertaEConcluiQuandoSuspeita` não usa `InOrder`. O ponto central da correção, "concluir só depois de publicar", **não é testado**: se o `concluir` viesse antes do loop, o teste passaria.
+  - `eventoPelaMetadeFalhaEmVezDeSumir` não verifica `never().liberar(...)`. Liberar a chave de outro consumidor seria o bug grave desse caminho.
+  - Faltam casos para: `valor`/`dataHora`/`accountId` nulos, payload `null`, falha no `concluir`, `Error`, e falha no 2º alerta depois do 1º confirmado.
+- `IdempotenciaServiceTest`:
+  - `eventoNovoComecaEmProcessamento` usa `any(Duration.class)`, então o TTL de 5 min não é verificado.
+  - Não cobre: GET `null`, `marcarNotificado`, `jaNotificado=false`.
+- `NotificacaoListenerTest`:
+  - `enviaEMarcaQuandoAindaNaoNotificado` não verifica a ordem. Marcar **antes** de enviar, o que perderia notificações, passaria no teste.
+  - Falta o teste "gateway falha, então não marca", que é o caso mais importante.
+- `KafkaConfig` e o `@RetryableTopic` continuam sem teste de integração (`@EmbeddedKafka`), apesar de o `spring-boot-starter-kafka-test` estar no pom.
+
+---
+
+#### TAREFA 2: Problemas NOVOS introduzidos pelo commit
+
+1. **ALTA – A notificação passou a depender do Redis** (`NotificacaoListener.java:32,37`).
+   - Antes, com o Redis fora, a notificação era enviada.
+   - Agora, com o Redis fora por mais de cerca de 3s, **todos** os alertas vão para a `alerts-dlt` e nada reprocessa.
+   - Isso contradiz "Funcionar com serviço auxiliar fora".
+   - Correção: fail-open no `jaNotificado` (logar e enviar) e capturar falha do `marcarNotificado` sem relançar.
+2. **ALTA – Crash ou rebalance vira DLQ de forma determinística** (`TransacaoListener.java:43` + `KafkaConfig.java:40`). Detalhes em P1: TTL de 300s contra retry de cerca de 3s, e sem consumidor da DLT.
+3. **MÉDIA – `alertaId` com `transactionId` nulo ou reutilizado suprime notificações reais** (`Alerta.java:17` + `NotificacaoListener.java:32`).
+   - Todas as transações sem `transactionId` geram `null:VALOR_ALTO`. Depois do primeiro push, as demais são descartadas como "já notificado" por 24h. Isso é perda silenciosa para o cliente.
+   - O mesmo vale se o emissor reutiliza `transactionId` entre eventos diferentes (por exemplo, autorização e captura).
+   - Também vale se houver duas configs do mesmo `tipo` com ids diferentes: `Regra.id()` é fixo (`ValorAltoRegra.java:16`), então as duas geram o mesmo `alertaId`.
+4. **MÉDIA – `concluir` e `liberar` sem token de dono** (`IdempotenciaService.java:31-37`). Depois do TTL ou de um rebalance, um processamento zumbi apaga o lock de quem está ativo, ou marca `CONCLUIDO` no lugar dele (ver P1).
+5. **MÉDIA – Dedup da notificação com corrida** entre o container principal e o de `alerts-retry` (ver N1).
+6. **MÉDIA – `NewTopic` com `replicas(1)` e 24 partições fixos** (`KafkaConfig.java:21,26,31`).
+   - Num cluster com `min.insync.replicas=2`, a publicação falha 100% das vezes.
+   - Se o tópico existir com menos partições, o boot aumenta para 24 e quebra a ordem por conta.
+7. **MÉDIA – Timeout do SETNX com o comando executado no servidor deixa `PROCESSANDO` órfão**, e o evento vai para a DLQ (ver a corrida em `iniciar`).
+8. **BAIXA – A semântica de `geradoEm` mudou** (`Alerta.java:19`).
+   - O campo agora guarda a hora da transação, não a de geração do alerta. Quem medir a latência evento → alerta (meta de 500 ms) por esse campo vai medir zero.
+   - Sugestão: renomear para `dataTransacao`. Se precisar da hora de geração, mandar em header, não no payload deduplicado.
+9. **BAIXA – Mensagem fixa na `DltHandler`** (`NotificacaoListener.java:43`).
+   - O texto diz "depois de 4 tentativas", mas uma `JacksonException` chega com 1.
+   - O log não traz nenhum identificador operacional: nem tópico, partição, offset ou `alertaId`. Isso dificulta a investigação.
+   - Além disso, `logging.level...retrytopic=OFF` (`application.properties:15`) continua escondendo o fluxo de retry.
+10. **BAIXA – Capturar `Error` e chamar o Redis no `catch`** (`TransacaoListener.java:56-61`). Sob OOM isso pode piorar a situação, e um `Error` vindo do `liberar` substitui o original.
+
+---
+
+#### TAREFA 3: Afirmações do README que não batem com o código
+
+1. **Idempotência com Redis** (README:96): *"O eventId é gravado com SETNX e TTL de 24 h. Se o processamento falhar, a marca é apagada..."* — **FALSO** no modelo atual.
+   - O SETNX grava `PROCESSANDO` com TTL de **5 min** (`IdempotenciaService.java:23`).
+   - O TTL de 24h é do `CONCLUIDO`, gravado com SET comum no fim (linha 32).
+   - A marca só é apagada em falha por exceção com o processo vivo. Em crash, ela fica 5 min e a nova entrega vai para a DLQ.
+2. **Tabela de requisitos, linha Idempotência** (README:83): *"SETNX no Redis por eventId, liberado em caso de falha"* — **impreciso**. Falta o modelo de dois estados, o caso de crash e a dedup da notificação por `notif:<alertaId>`.
+3. **Tabela, "Funcionar com serviço auxiliar fora: Feito"** (README:82) — **exagerado**.
+   - Redis fora manda todas as transações para a `transactions-dlt` e todas as notificações para a `alerts-dlt`.
+   - Postgres fora no boot faz os eventos serem marcados `CONCLUIDO` sem nenhuma regra avaliada (`RegraCache.java:17`).
+4. **Demonstração 1** (README:70): *"PUT ... com limite 5000. Em até 10 segundos uma transação de R$ 7.000 passa a gerar alerta"* — **só é verdade com condições**.
+   - A comparação está certa: `7000.compareTo(5000) > 0`, em `ValorAltoRegra.java:21`.
+   - Mas o `RegraController.salvar` (linhas 23-27) **substitui a entidade inteira**:
+     - Com `{"limite":5000}`, fica `ativa=false` e `tipo=null`. A regra é desativada e nenhum alerta sai.
+     - Com `ativa:true` sem `tipo`, o `switch` do `RegraCache.java:42` dá NPE e congela todas as regras.
+   - O README não mostra o corpo completo dessa chamada.
+   - Se o leitor reaproveitar o comando da linha 50 trocando só o valor, o `eventId` `ev-1` já está `CONCLUIDO` e a transação é **ignorada por 24h**. É preciso avisar para trocar o `eventId`.
+   - "Em até 10 segundos" vale aproximadamente (`fixedDelay=10000` mais o tempo da carga).
+5. **Demonstração 2** (README:71): *"a notificação tenta 4 vezes e manda para alerts-dlt"* — **verdadeiro** (`attempts="4"`, `IllegalStateException` retentável). Ressalvas:
+   - Ao voltar com `/true`, nada reprocessa a `alerts-dlt`.
+   - Com o Redis fora, o mesmo acontece mesmo com a notificação no ar.
+6. **Demonstração 3** (README:72): JSON quebrado vai para a `transactions-dlt` — **verdadeiro**. `JacksonException` não é retentável (`KafkaConfig.java:43`), e o tópico agora existe. Campos obrigatórios nulos e o payload `null` também vão para lá, mas o README não cita.
+7. **Demonstração 4** (README:73): *"a mesma mensagem enviada duas vezes gera um alerta só"* — **verdadeiro no envio sequencial dentro de 24h**, com estas ressalvas:
+   - O correto é "um alerta **por regra**".
+   - Se a 2ª cópia chegar enquanto a 1ª ainda processa, ela entra em `EM_PROCESSAMENTO` e é retentada.
+   - Depois de um crash, a 2ª cópia vai para a DLQ.
+8. **Arquitetura** (README:17): *"tópico transactions (24 partições, chave accountId)"*.
+   - A chave é responsabilidade do produtor. O próprio comando da linha 50-51 usa `kafka-console-producer` **sem chave** (sem `parse.key`), então a ordem por conta não vale na demo.
+   - O README:19 lista o Redis só para idempotência por `eventId` e frequência. Falta a dedup da notificação (`notif:`).
+   - O diagrama ASCII não mostra a `transactions-dlt`.
+   - "Notificação → [alerts-dlt]" está correto.
+9. **Alerta confirmado** (README:98): *"acks=all, produtor idempotente... nenhum alerta some"* — **impreciso**.
+   - Com `replicas(1)` (`KafkaConfig.java:31`), o `acks=all` equivale a `acks=1`, sem durabilidade se o disco falhar.
+   - O timeout ambíguo do `get(5s)` (`AlertaPublisher.java:24`) gera duplicatas.
+   - Eventos desviados para a `transactions-dlt` sem consumidor não geram alerta.
+   - O custo não é só de latência: o envio trava a partição por até cerca de 65s por alerta.
+10. **Erros no consumo** (README:100):
+    - *"Falha passageira é tentada 3 vezes"* é ambíguo: são 3 **novas** tentativas, 4 execuções no total (`FixedBackOff(1000L, 3)`).
+    - *"erro de dado (JSON inválido, evento sem id)"* está incompleto: também `valor`, `dataHora`, `accountId` nulos e payload `null`.
+    - Não menciona que um evento "em processamento" vai para a DLQ em cerca de 3s.
+    - A ideia de "a marca é apagada em falha" (README:96) só vale para exceção com o processo vivo. Em crash, a marca **não** é apagada.
+11. **Limitações conhecidas** (README:126-133):
+    - *"A notificação não tem idempotência própria"* — **desatualizado**: agora tem (`NotificacaoListener.java:32-37`), ainda que não atômica. O "nem circuit breaker" continua verdadeiro.
+    - *"O cache de regras começa vazio: ... nada é avaliado até ele voltar"* — **atenua o problema**. Os eventos consumidos nesse intervalo são marcados `CONCLUIDO` e **nunca** são avaliados. É perda permanente, não atraso. A corrida também pode acontecer em qualquer boot, mesmo com o Postgres no ar, entre o `@Scheduled` e o início do container Kafka.
+    - **Limitações que faltam:**
+      - Ninguém consome nem reprocessa a `transactions-dlt` e a `alerts-dlt`.
+      - Crash leva à DLQ (P1).
+      - Redis fora leva tudo para as DLQs.
+      - O antifraude interno precisa deduplicar por `alertaId`, porque continua havendo duplicatas em `alerts`.
+      - O `PUT /regras` substitui a entidade, e uma configuração inválida derruba a detecção.
+      - Os tópicos são criados com RF 1.
+      - O `NotificacaoGateway.java:23-24` ainda loga `accountId`, o que contradiz "logs sem dados pessoais" (README:118).
+      - O `/simulacao` não tem `@Profile`.
+12. **Curls do `PUT /regras`** (README:40-44): **batem com o código**.
+    - Path `/regras/{id}`, método PUT (`RegraController.java:9,23`).
+    - Campos `tipo`, `limite`, `janelaSegundos` e `ativa` batem com os getters e setters de `RegraConfig.java:12-26`. A propriedade `ativa` vem de `isAtiva`/`setAtiva`.
+    - O `id` vem do path.
+    - Ressalva: o id do path não define o comportamento (quem define é o `tipo`), e o `alertaId` usa o `Regra.id()` fixo, não o id da configuração.
+13. **Fora do foco, mas falso** (README:109): *"SpotBugs...; O PMD ... foi removido"*. No `pom.xml:126-134` o `maven-pmd-plugin` continua, e o SpotBugs foi removido no commit 93b474c (o `spotbugs-exclude.xml` ficou órfão). É o inverso do que o texto diz.
+
+---
+
+**Arquivos relevantes:**
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/kafka/TransacaoListener.java
 - /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/idempotencia/IdempotenciaService.java
 - /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/kafka/KafkaConfig.java
-- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/kafka/TransacaoListener.java
 - /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/notificacao/NotificacaoListener.java
-- /workspaces/motor-antifraude/motor-deteccao/src/main/resources/application.properties
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/domain/Alerta.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/kafka/AlertaPublisher.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/regras/RegraCache.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/regras/ValorAltoRegra.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/regras/FrequenciaRegra.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/api/RegraController.java
+- /workspaces/motor-antifraude/motor-deteccao/src/test/java/com/mica/motor/kafka/TransacaoListenerTest.java
 - /workspaces/motor-antifraude/motor-deteccao/src/test/java/com/mica/motor/idempotencia/IdempotenciaServiceTest.java
-- /workspaces/motor-antifraude/motor-deteccao/target/site/jacoco/index.html
-- /workspaces/motor-antifraude/motor-deteccao/target/site/jacoco/jacoco.csv
+- /workspaces/motor-antifraude/motor-deteccao/src/test/java/com/mica/motor/notificacao/NotificacaoListenerTest.java
+- /workspaces/motor-antifraude/README.md
 - /workspaces/motor-antifraude/docker-compose.yml
+- /workspaces/motor-antifraude/motor-deteccao/pom.xml
+
+**Prioridade sugerida:**
+1. Token de dono e "assumir após rebalance" no `PROCESSANDO`, ou backoff maior que o TTL só para `EventoEmProcessamentoException`.
+2. Fail-open e lock atômico na dedup da notificação.
+3. Validar `transactionId` e a `RegraConfig`.
+4. Externalizar partições e RF dos tópicos.
+5. Corrigir as seções Idempotência, Limitações e Análise estática do README.
 
 ---
 
@@ -471,6 +638,157 @@ Pontos da rodada 2 que continuam abertos e foram agravados pelo item 1:
 
 ---
 
-## Relatório do agente caca-bugs
+## Relatório completo do agente codigo-morto
 
-_Pendente: será incluído quando o agente terminar._
+### Rodada 3: código sem uso, duplicação e conferência do README (motor-deteccao)
+
+Não alterei nenhum arquivo. Não tinha shell, então não rodei git nem o build. Separei o que é novo do que é pré-existente usando a lista de mudanças de b83719b que você me passou.
+
+Um ponto antes de tudo: segundo o git status do início da sessão, o README.md está modificado e ainda não foi commitado. O AI_USAGE.md e o docs/revisao-ia/ não são rastreados pelo git. O texto do README que conferi é o que está no disco, não o que está em b83719b.
+
+---
+
+#### TAREFA 1: código sem uso, sobras e duplicação
+
+##### 1.1 O que você citou e continua em uso (não é código morto)
+
+- **`IdempotenciaService.liberar()`** (`src/main/java/com/mica/motor/idempotencia/IdempotenciaService.java:35-37`)
+  - Ainda é necessário. É chamado em `kafka/TransacaoListener.java:58` e testado em `IdempotenciaServiceTest.java:60-63` e `TransacaoListenerTest.java:100,109`.
+  - Sem ele, a marca `PROCESSANDO` fica no Redis por 5 minutos (`IdempotenciaService.java:23`). Aí cada nova tentativa daria `EventoEmProcessamentoException`, e com as 3 tentativas a 1s de intervalo (`KafkaConfig.java:40`) o evento iria para a DLT.
+  - Com o `liberar`, a nova tentativa começa limpa. O `liberar` só deixaria de ser necessário se o backoff passasse a ser maior que o TTL de 5 minutos.
+- **Imports de `IllegalArgumentException`/`IllegalStateException`:** não existem. As duas classes são de `java.lang`, então não precisam de import.
+  - `IllegalArgumentException` não aparece mais no `KafkaConfig`: `KafkaConfig.java:43` usa só `JacksonException` e `EventoInvalidoException`. O único uso restante é `regras/RegraCache.java:48`, que é pré-existente e é capturado pelo `catch (Exception)` da linha 36.
+  - `IllegalStateException` continua em uso em `AlertaPublisher.java:27,29`, `NotificacaoGateway.java:21` e nos testes.
+- **`RegraCache` em `TransacaoListenerTest`:** é usado. O import fica em `TransacaoListenerTest.java:18`, e a classe é usada como variável local na linha 42 (`mock(RegraCache.class)`) e no construtor na linha 49.
+- **`Instant` em `domain/Alerta.java:4`:** é usado como tipo do campo `geradoEm` (linha 12). A mudança foi só no valor, que agora é `t.dataHora()` na linha 19.
+- **`EventoInvalidoException` e `EventoEmProcessamentoException` (novas):** as duas são usadas. A primeira aparece em `TransacaoListener.java:68,71` e `KafkaConfig.java:43`. A segunda aparece em `TransacaoListener.java:43`. As duas são testadas.
+- **`jaNotificado` e `marcarNotificado` (novos):** os dois são usados em `NotificacaoListener.java:32,37`.
+- **Imports dos arquivos novos ou alterados:** nenhum está sobrando. Conferi `IdempotenciaService`, `TransacaoListener`, `KafkaConfig` (`NewTopic`, `TopicBuilder`, `TopicPartition` etc.), `NotificacaoListener` (`JacksonException` na linha 28), `Alerta` e os três testes alterados. Por exemplo, `assertEquals` e `anyString` em `TransacaoListenerTest.java:3,6` são usados nas linhas 101 e 113-114.
+
+##### 1.2 Duplicação e constantes repetidas
+
+**Novos (b83719b):**
+1. **Prefixo `"notif:"` duplicado** em `IdempotenciaService.java:40` e `:44`. Já o `"evento:"` está centralizado em `chave()` na linha 48. Falta o equivalente para a notificação, algo como `chaveNotif()`.
+2. **TTL de 24h duplicado** em `IdempotenciaService.java:32` e `:44` (`Duration.ofHours(24)`). Os TTLs de 5 minutos (linha 23) e de 24h poderiam virar constantes.
+3. **As constantes `PROCESSANDO`/`CONCLUIDO` (`IdempotenciaService.java:12-13`) são package-private, mas o teste repete os literais.** O teste está no mesmo pacote, mas usa as strings direto em `IdempotenciaServiceTest.java:35,41,42,48,49,56`. O mesmo vale para `"evento:ev-1"` (linhas 35-62).
+4. **O nome `CONCLUIDO` aparece duas vezes:** como a constante String da linha 13 e como o valor do enum `Inicio.CONCLUIDO` da linha 10. Funciona, mas a linha 28 (`CONCLUIDO.equals(atual) ? Inicio.CONCLUIDO`) fica ambígua para quem lê.
+5. **Nomes de tópico espalhados, sem uma constante comum:**
+   - `"transactions"`: `KafkaConfig.java:21` (novo) e `TransacaoListener.java:32`.
+   - `"alerts"`: `KafkaConfig.java:31` (novo), `AlertaPublisher.java:24` e `NotificacaoListener.java:29`.
+   - `"transactions-dlt"` escrito por extenso em `KafkaConfig.java:26` (novo), enquanto a linha 37 do mesmo arquivo monta o mesmo nome com `registro.topic() + "-dlt"`. Ou seja, o sufixo `-dlt` está definido duas vezes no mesmo arquivo. Além disso, o sufixo de `alerts-dlt` é implícito, vem do padrão do `@RetryableTopic`.
+6. **`.replicas(1)` repetido três vezes** em `KafkaConfig.java:21,26,31` (novo).
+7. **O número de partições, 24, aparece em dois lugares:** `KafkaConfig.java:17` (`PARTICOES = 24`, novo) e `docker-compose.yml:14` (`KAFKA_NUM_PARTITIONS: 24`, pré-existente).
+   - Hoje o valor do compose só vale para tópicos criados automaticamente que não têm `NewTopic`: `alerts-dlt` e os `alerts-retry-*`.
+   - Observação: o `@RetryableTopic` cria esses tópicos com a configuração padrão dele, e não com `PARTICOES`, então a contagem de partições pode não bater com a de `alerts`. É o mesmo número em dois lugares, sem garantia de que continuem iguais.
+8. **O número de tentativas, 4, aparece duas vezes:** em `NotificacaoListener.java:28` (`attempts = "4"`) e no texto do log da linha 43 ("depois de 4 tentativas").
+
+**Pré-existentes (continuam):**
+- **IDs de regra:** `"VALOR_ALTO"`/`"FREQUENCIA"` estão em `RegraCache.java:43-44`, `ValorAltoRegra.java:16` e `FrequenciaRegra.java:21`.
+- **Fixture de `Alerta`:** repetida em `NotificacaoGatewayTest.java:14-15` e `NotificacaoListenerTest.java:23-24`.
+- **Fixture de `Transacao`:** repetida em `TransacaoListenerTest.java:34-35,119-120`, `ValorAltoRegraTest.java:16-17` e `FrequenciaRegraTest.java:33-34`.
+
+##### 1.3 Validação de campos duplicada?
+
+Não há duplicação. `TransacaoListener.validar` (linhas 66-73, novo) é o único lugar que valida. O Grep por `jakarta.validation`, `@Valid`, `@NotNull` e `@NotBlank` não encontra nada no projeto, e `domain/Transacao.java` não tem anotações. As regras não checam nulos (`ValorAltoRegra.java:21`, `FrequenciaRegra.java:27`), porque contam com o `validar`.
+
+Duas observações sobre o código novo:
+- **Falta de teste:** só o eventId nulo é testado (`TransacaoListenerTest.java:118-125`). Os casos de `valor`, `dataHora` e `accountId` nulos e de eventId em branco não têm teste. Isso confere com o JaCoCo, que mostra 5 desvios não cobertos em `TransacaoListener`.
+- **Mensagem duplicada:** as duas mensagens de erro de `validar` (linhas 68 e 71) repetem a montagem `"Evento ..."`, também usada em `EventoEmProcessamentoException.java:6`. É pequeno.
+
+##### 1.4 `logging.level.org.springframework.kafka.retrytopic=OFF`
+
+- Continua em `src/main/resources/application.properties:15` (pré-existente).
+- Ainda tem efeito, porque o `@RetryableTopic` continua em `NotificacaoListener.java:28`. Mas desliga **todo** o log do retry topic, inclusive erros.
+- Com o `exclude = JacksonException.class` (novo), um JSON inválido em `alerts` vai direto para a DLT. O único registro disso é o `log.error` sem payload da linha 43.
+- Recomendo `WARN` no lugar de `OFF`.
+
+##### 1.5 Outras propriedades em application.properties
+
+Tudo é lido. `spring.kafka.consumer.group-id` (linha 12) é usado pelo `TransacaoListener`, que não define `groupId` próprio. As linhas 17-18 (`acks=all`, `enable.idempotence=true`) continuam sendo redundantes, porque já são o padrão do cliente Kafka. Isso já foi apontado na rodada 2.
+
+##### 1.6 Itens da rodada 2: continuam lá?
+
+| Item | Situação |
+|---|---|
+| `spotbugs-exclude.xml` órfão (`/workspaces/motor-antifraude/motor-deteccao/spotbugs-exclude.xml`) | **Continua.** Nada aponta para ele: o Grep fora de `target/` só encontra os relatórios de revisão. |
+| `spring-boot-starter-validation` (`pom.xml:49-52`) e `spring-boot-starter-validation-test` (`pom.xml:93-97`) | **Continuam sem uso.** Não há nenhuma ocorrência de `jakarta.validation` nem `@Valid`. |
+| Starters de teste sem uso: `actuator-test` (`pom.xml:73-77`), `data-jpa-test` (78-82), `data-redis-test` (83-87), `kafka-test` (88-92), `webmvc-test` (98-102) | **Continuam.** Não há `@EmbeddedKafka`, `@WebMvcTest`, `@DataJpaTest` nem `@DataRedisTest`. O único teste com Spring é `@SpringBootTest` em `MotorDeteccaoApplicationTests.java:6`. Se forem removidos, mantenha um starter que traga JUnit e Mockito. |
+| `HELP.md` (`/workspaces/motor-antifraude/motor-deteccao/HELP.md`) | **Continua no disco, mas está em `.gitignore:1`**, então não vai para o repositório. Isso é só limpeza local. |
+| `MotorDeteccaoApplicationTests.contextLoads()` vazio (`MotorDeteccaoApplicationTests.java:9-11`) | **Continua.** Precisa da infraestrutura no ar. |
+| **Novo, achado nesta rodada:** `maven-pmd-plugin` (`pom.xml:126-134`) | Não tem `<executions>`, então não roda no build. É configuração morta e contradiz o README (veja 2.4). |
+
+---
+
+#### TAREFA 2: conferência do README (TESTES, BUILD, FERRAMENTAS)
+
+##### 2.1 O comando `./mvnw test -Dtest='*RegraTest,IdempotenciaServiceTest,TransacaoListenerTest,RegraCacheTest,Notificacao*Test'` (README.md:64)
+
+- **Todos os padrões casam com classes que existem:**
+  - `*RegraTest` casa com `ValorAltoRegraTest` e `FrequenciaRegraTest`. Ele **não** casa com `RegraCacheTest`, que termina em `CacheTest`, e por isso esse teste aparece listado à parte.
+  - `IdempotenciaServiceTest`, `TransacaoListenerTest` e `RegraCacheTest` casam com o nome exato.
+  - `Notificacao*Test` casa com `NotificacaoGatewayTest` e `NotificacaoListenerTest`.
+- **Fica de fora só o `MotorDeteccaoApplicationTests`** (o padrão termina em `Tests`). É o `@SpringBootTest` que precisa de Postgres, Redis e Kafka. Excluir ele é proposital e está correto.
+- **Nenhum dos testes incluídos precisa de Docker.** Todos usam só Mockito.
+- Os `target/surefire-reports` têm exatamente essas 7 classes e 26 casos: 6 de Idempotencia, 7 de TransacaoListener, 4 de RegraCache, 3 de ValorAlto, 2 de Frequencia, 2 de NotificacaoListener e 2 de NotificacaoGateway.
+- **Imprecisões:**
+  - O README não avisa que um simples `./mvnw test`, sem o `-Dtest`, roda o `contextLoads` e falha sem a infraestrutura.
+  - A rodada 2 diz "19 testes", e hoje são 26. Não é erro do README, mas as contagens nos relatórios de revisão ficaram desatualizadas.
+- O comentário `# relatório: target/site/jacoco/index.html` (README.md:65) está correto, porque o `report` está ligado à fase `test` (`pom.xml:117-123`).
+
+##### 2.2 "Unitários: regras (incluindo o limite exato), idempotência, listener (...), cache de regras (...) e notificação" (README.md:106)
+
+| Afirmação | Teste | Situação |
+|---|---|---|
+| regras, limite exato | `ValorAltoRegraTest.exatamenteNoLimiteNaoEhSuspeita` (:26). A fronteira da frequência está em `FrequenciaRegraTest` (:38, :44) | OK |
+| idempotência | `IdempotenciaServiceTest` (6 testes) | OK. Falta testar `marcarNotificado` e `jaNotificado == false` |
+| listener: publica só quando suspeita | `publicaAlertaEConcluiQuandoSuspeita` (:53) e `naoPublicaQuandoNaoSuspeitaMasConclui` (:64) | OK |
+| listener: ignora duplicado | `ignoraEventoJaConcluido` (:75) | OK. O termo "duplicado" agora significa "já concluído" |
+| listener: libera a marca quando a publicação falha | `liberaENãoConcluiQuandoPublicacaoFalha` (:93) | OK. O nome do método tem um caractere não ASCII ("ã"), diferente dos outros testes |
+| cache: Postgres fora do ar | `RegraCacheTest.postgresForaDoArMantemUltimasRegras` (:54) | OK |
+| cache: tipo inválido | `tipoDesconhecidoNaoDerrubaOMotor` (:66) | OK |
+| notificação | `NotificacaoGatewayTest` e `NotificacaoListenerTest` | OK |
+
+**O README está incompleto, e não errado:** não cita testes que existem.
+- `eventoPelaMetadeFalhaEmVezDeSumir` (:85)
+- `falhaAoLiberarNaoEscondeOErroOriginal` (:105)
+- `eventoSemIdEhInvalido` (:118)
+- `NotificacaoListenerTest.naoEnviaDeNovoAlertaRepetido` (:46)
+
+**Falsas fora da seção de testes, mas causadas pelo b83719b:**
+- **README.md:132**, "A notificação não tem idempotência própria": é **falso** agora. A deduplicação por `alertaId` existe em `NotificacaoListener.java:32-37` e `IdempotenciaService.java:39-45`. A parte "nem circuit breaker" continua verdadeira.
+- **README.md:83** ("`SETNX` no Redis por `eventId`, liberado em caso de falha") e **README.md:96** ("O `eventId` é gravado com `SETNX` e TTL de 24 h"): são **imprecisas**. Agora são dois estados: `PROCESSANDO`, com TTL de 5 minutos via `setIfAbsent` (`IdempotenciaService.java:23`), e `CONCLUIDO`, com TTL de 24h gravado por `SET` (linha 32). O TTL de 24h não vem do SETNX.
+- **README.md:96**, "permite que quem consome o alerta descarte repetidos": é verdadeira e já está implementada, mas não diz que ela existe.
+
+##### 2.3 "Cobertura (JaCoCo): 84% das instruções e 80% dos desvios" (README.md:107)
+
+- **É falsa em relação ao relatório que está no repositório.** O rodapé de `target/site/jacoco/index.html` mostra "182 of 754" instruções perdidas, ou seja, **75%**, e "9 of 40" desvios perdidos, ou seja, **77%**. A soma das linhas de `target/site/jacoco/jacoco.csv` dá o mesmo resultado: 572 de 754 e 31 de 40.
+- **O relatório parece atual, e não velho.** Ele já inclui as classes de b83719b: `IdempotenciaService.Inicio`, `EventoEmProcessamentoException` e `KafkaConfig` com 6 métodos, que são o construtor, os 3 beans `NewTopic`, o `errorHandler` e o lambda. Também bate com os 26 casos do surefire. O mais provável é que **84%/80% sejam de uma medição anterior** a b83719b. O KafkaConfig cresceu com 65 instruções não cobertas, e isso puxou a média para baixo.
+- **"Ficaram de fora os controllers e a classe main" está incompleto.** Também ficaram com 0% o `AlertaPublisher` (45 instruções) e o `KafkaConfig` (65), que juntos somam mais instruções perdidas que os controllers e a main (43).
+- **Ressalva:** como não tenho git, não sei os horários dos arquivos. A conclusão de que o relatório está atual vem da coerência entre o conteúdo do relatório e o código-fonte.
+
+##### 2.4 "Análise estática: SpotBugs; os avisos EI_EXPOSE_REP ... foram filtrados. O PMD não lê as classes do Java 25 ... e foi removido." (README.md:109)
+
+- **"SpotBugs" é falso.** Não há plugin SpotBugs no `pom.xml`: o Grep por "spotbugs" no pom não encontra nada, e o commit 93b474c se chama "removido spotbugs suporte". O filtro de EI_EXPOSE_REP só existe no `spotbugs-exclude.xml`, que está órfão.
+- **"O PMD foi removido" é falso.** O `maven-pmd-plugin` 3.26.0 continua em `pom.xml:126-134`, com `failOnViolation=false` e sem `<executions>`. Ele só roda se alguém chamar `mvn pmd:check` à mão.
+- O README descreve o contrário do pom: diz que o SpotBugs ficou e o PMD saiu, mas no pom o PMD ficou e o SpotBugs saiu.
+- **"classes do Java 25" é impreciso.** O pom declara `<java.version>21</java.version>` (`pom.xml:30`), igual ao README.md:18 e :26. Se o problema era o JDK 25 do ambiente rodando a ferramenta, o texto deveria dizer isso, porque as classes são compiladas para Java 21. Não consegui confirmar a versão do JDK do ambiente.
+
+##### 2.5 Menção a `AI_USAGE.md` (README.md:110 e :147)
+
+O arquivo existe em `/workspaces/motor-antifraude/AI_USAGE.md`. Mas segundo o git status ele **não é rastreado** (`?? ../AI_USAGE.md`), assim como `docs/revisao-ia/`. Se o README for commitado sem ele, o link fica quebrado no repositório.
+
+---
+
+##### Arquivos relevantes
+- /workspaces/motor-antifraude/README.md
+- /workspaces/motor-antifraude/motor-deteccao/pom.xml
+- /workspaces/motor-antifraude/motor-deteccao/spotbugs-exclude.xml
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/idempotencia/IdempotenciaService.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/kafka/KafkaConfig.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/kafka/TransacaoListener.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/java/com/mica/motor/notificacao/NotificacaoListener.java
+- /workspaces/motor-antifraude/motor-deteccao/src/main/resources/application.properties
+- /workspaces/motor-antifraude/motor-deteccao/src/test/java/com/mica/motor/idempotencia/IdempotenciaServiceTest.java
+- /workspaces/motor-antifraude/motor-deteccao/target/site/jacoco/index.html
+- /workspaces/motor-antifraude/motor-deteccao/target/site/jacoco/jacoco.csv
+- /workspaces/motor-antifraude/docker-compose.yml

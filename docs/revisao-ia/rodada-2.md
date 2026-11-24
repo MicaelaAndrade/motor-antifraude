@@ -4,6 +4,7 @@
 - **Commit revisado:** `30fcc24` — fix: não perder eventos (idempotência liberada em falha, DLQ e envio de alerta confirmado)
 - **Objetivo:** verificar se A1, A2 e A7 da [rodada 1](rodada-1.md) foram resolvidos e se as correções criaram problemas novos
 - **Agentes:** `caca-bugs`, `arquiteto` e `codigo-morto`, em paralelo
+- **Próxima rodada:** [rodada-3.md](rodada-3.md)
 - **Observação:** os agentes não alteraram arquivos. Os pontos de maior gravidade (N1, N2, A3) foram conferidos no código depois das revisões.
 
 ## Resumo consolidado

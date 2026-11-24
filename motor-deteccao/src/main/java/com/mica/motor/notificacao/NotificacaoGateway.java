@@ -20,7 +20,6 @@ public class NotificacaoGateway {
         if (!disponivel) {
             throw new IllegalStateException("Provedor de notificação indisponível");
         }
-        log.info("PUSH e E-MAIL enviados para a conta {}: alerta {}",
-                alerta.accountId(), alerta.alertaId());
+        log.info("Notificação enviada para o alerta {}", alerta.alertaId());
     }
 }

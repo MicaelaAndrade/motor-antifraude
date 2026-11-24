@@ -67,7 +67,7 @@ public class TransacaoListener {
         if (t == null || t.eventId() == null || t.eventId().isBlank()) {
             throw new EventoInvalidoException("Evento sem eventId");
         }
-        if (t.valor() == null || t.dataHora() == null || t.accountId() == null) {
+        if (t.valor() == null || t.dataHora() == null || t.accountId() == null ||  t.accountId().isBlank() ||  t.transactionId() == null || t.transactionId().isBlank()) {
             throw new EventoInvalidoException("Evento " + t.eventId() + " com campo obrigatório vazio");
         }
     }

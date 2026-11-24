@@ -115,7 +115,7 @@ class TransacaoListenerTest {
     }
 
     @Test
-    void eventoSemIdEhInvalido() {
+    void eventoSemTransactionIdEhInvalido() {
         Transacao semId = new Transacao(null, "tx-2", "conta-1",
                 new BigDecimal("10"), "BR", "Loja", Instant.now());
         when(objectMapper.readValue("sem-id", Transacao.class)).thenReturn(semId);
