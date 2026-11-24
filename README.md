@@ -6,7 +6,7 @@ O motor recebe eventos de transações em tempo real pelo Kafka, aplica regras d
 
 ## Arquitetura
 
-Diagrama da arquitetura-alvo: `docs/arquitetura-motor-antifraude.drawio` (abre no draw.io). O esquema abaixo mostra o que está implementado; circuit breaker, base de clientes e o bloco de segurança do diagrama ainda são proposta.
+Diagrama da arquitetura-alvo: `docs/arquitetura-motor-antifraude.drawio` (abre no draw.io). O esquema abaixo mostra o que está implementado. Circuit breaker, base de clientes e o bloco de segurança do diagrama ainda são proposta; e, ao contrário do diagrama, a API de regras e a notificação rodam dentro do motor, e existe também a `transactions-dlt`.
 
 ```mermaid
 flowchart LR
@@ -113,7 +113,7 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 **Kafka em vez de RabbitMQ.** Minha experiência anterior é com RabbitMQ. Escolhi Kafka porque o case pede vazão alta e ordem por conta: com o `accountId` como chave, as regras com estado veem as transações de uma conta em ordem; o log retido permite reprocessar; e vários consumidores leem o mesmo alerta. Custo: operar Kafka é mais complexo.
 
-**Regras como dados.** Cada regra é uma linha no Postgres; o motor relê as regras ativas a cada 10 segundos e guarda em memória. Nenhuma transação consulta o Postgres, o que protege a latência, e uma queda do Postgres depois da subida não para a detecção. Trade-off: uma mudança leva até 10 segundos para valer. Cada tipo de regra implementa a interface `Regra`; um tipo novo exige a classe e uma linha no `RegraCache`, com deploy.
+**Regras como dados.** Cada regra é uma linha no Postgres; o motor relê as regras ativas a cada 10 segundos e guarda em memória. Nenhuma transação consulta o Postgres, o que protege a latência, e uma queda do Postgres depois da subida não para a detecção. Trade-off: uma mudança leva até 10 segundos para valer. Cada tipo de regra implementa a interface `Regra`; um tipo novo exige a classe e um `case` no `RegraCache`, com deploy.
 
 **Idempotência em dois estados.** Ao chegar, o evento recebe a marca "em processamento" no Redis (`SETNX`, TTL de 5 min). Só depois de publicar todos os alertas ele vira "concluído" (TTL de 24 h). Se o processamento falhar com exceção, a marca é apagada para a nova tentativa. Se o processo cair no meio, a marca fica até expirar e o evento vai para a DLQ, em vez de ser perdido em silêncio. O `alertaId` (`transactionId:regraId`) é estável e a notificação o usa para não notificar duas vezes.
 
@@ -125,8 +125,8 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 ## Estratégia de testes
 
-- **Unitários (JUnit 5 + Mockito):** regras (incluindo o limite exato), idempotência, listener (publica só quando suspeita, ignora evento concluído, falha em vez de perder evento interrompido, não esconde o erro original, rejeita evento sem `eventId` ou sem `transactionId`), cache de regras (Postgres fora do ar, tipo inválido) e notificação (não reenvia alerta repetido). Os demais campos obrigatórios são validados no código, mas ainda sem teste.
-- **Cobertura (JaCoCo):** cerca de 76% das instruções e 74% dos desvios nos unitários. Ficaram sem cobertura os controllers, a classe main, o `AlertaPublisher` e o `KafkaConfig`, que pedem testes de integração.
+- **Unitários (JUnit 5 + Mockito):** 27 testes cobrindo regras (incluindo o limite exato), idempotência, listener (publica só quando suspeita, ignora evento concluído, falha em vez de perder evento interrompido, não esconde o erro original, rejeita evento sem `eventId` ou sem `transactionId`), cache de regras (Postgres fora do ar, tipo inválido) e notificação (não reenvia alerta repetido). Os demais campos obrigatórios são validados no código, mas ainda sem teste.
+- **Cobertura (JaCoCo):** cerca de 77% das instruções e 76% dos desvios nos unitários. Ficaram sem cobertura os controllers, a classe main, o `AlertaPublisher` e o `KafkaConfig`, que pedem testes de integração.
 - **Testes manuais de ponta a ponta:** os roteiros da seção Demonstrações.
 - **Revisão com agentes de IA:** quatro rodadas (a quarta só conferiu a documentação), com os relatórios em `docs/revisao-ia/`. Ver `AI_USAGE.md`.
 - **Análise estática:** SpotBugs e PMD foram testados e retirados (falsos positivos e incompatibilidade com o JDK 25 do ambiente). Fica como evolução.
@@ -170,4 +170,4 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 ## Uso de IA
 
-Detalhado em `AI_USAGE.md`.
+Detalhado em [AI_USAGE.md] (`AI_USAGE.md`).
