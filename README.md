@@ -6,7 +6,7 @@ O motor recebe eventos de transações em tempo real pelo Kafka, aplica regras d
 
 ## Arquitetura
 
-Diagrama da arquitetura-alvo: `docs/arquitetura-motor-antifraude.drawio` (abre no draw.io). O esquema abaixo mostra o que está implementado. Circuit breaker, base de clientes e o bloco de segurança do diagrama ainda são proposta; e, ao contrário do diagrama, a API de regras e a notificação rodam dentro do motor, e existe também a `transactions-dlt`.
+Diagrama da arquitetura-alvo: [docs/arquitetura-motor-antifraude.drawio](docs/arquitetura-motor-antifraude.drawio) (abre no draw.io). O esquema abaixo mostra o que está implementado. Circuit breaker, base de clientes e o bloco de segurança do diagrama ainda são proposta; e, ao contrário do diagrama, a API de regras e a notificação rodam dentro do motor, e existe também a `transactions-dlt`.
 
 ```mermaid
 flowchart LR
@@ -51,6 +51,8 @@ cd motor-deteccao
 ./mvnw spring-boot:run
 ```
 
+O motor não tem página na raiz (abrir `localhost:8080` dá 404). Para conferir se subiu: `curl localhost:8080/actuator/health`.
+
 Criar as regras (em outro terminal). O PUT substitui a regra inteira, então envie sempre todos os campos:
 
 ```bash
@@ -59,6 +61,9 @@ curl -X PUT localhost:8080/regras/VALOR_ALTO -H "Content-Type: application/json"
 
 curl -X PUT localhost:8080/regras/FREQUENCIA -H "Content-Type: application/json" \
   -d '{"tipo":"FREQUENCIA","limite":5,"janelaSegundos":120,"ativa":true}'
+
+# conferir
+curl localhost:8080/regras
 ```
 
 Enviar uma transação com chave `accountId` (na raiz do projeto):
@@ -69,12 +74,18 @@ echo 'conta-123|{"eventId":"ev-1","transactionId":"tx-1","accountId":"conta-123"
     --property parse.key=true --property key.separator='|'
 ```
 
-Cada novo teste precisa de um `eventId` novo: um `eventId` já processado é ignorado por 24 h (é a idempotência funcionando).
+No log do motor aparecem `SUSPEITA: transação tx-1 quebrou a regra VALOR_ALTO` e `Notificação enviada para o alerta tx-1:VALOR_ALTO`. Cada novo teste precisa de um `eventId` novo: um `eventId` já processado é ignorado por 24 h (é a idempotência funcionando).
 
 Ver os alertas:
 
 ```bash
 docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic alerts --from-beginning
+```
+
+Conferir se o Prometheus coleta o motor (deve responder `"health":"up"`):
+
+```bash
+curl -s localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"'
 ```
 
 Testes unitários e cobertura (não precisam de Docker):
@@ -89,10 +100,68 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 ## Demonstrações
 
-1. **Regra alterada sem redeploy:** com o motor rodando, envie `{"tipo":"VALOR_ALTO","limite":5000,"ativa":true}` para `PUT /regras/VALOR_ALTO`. Em cerca de 10 segundos, uma transação de R$ 7.000 (com `eventId` novo) passa a gerar alerta.
-2. **Notificação fora do ar:** `curl -X PUT localhost:8080/simulacao/notificacao/false`. O motor continua detectando e publicando em `alerts`; a notificação tenta 4 vezes e manda para `alerts-dlt`. Para voltar: `.../notificacao/true`.
-3. **Mensagem inválida:** um JSON quebrado, ou um evento sem campo obrigatório, vai para `transactions-dlt` em vez de ser descartado.
-4. **Idempotência:** a mesma mensagem enviada duas vezes gera um alerta por regra, uma vez só.
+Todas rodam na raiz do projeto, com o motor no ar e as regras criadas. A transação `tx-1` da seção anterior já deve ter sido enviada.
+
+### 1. Regra alterada sem redeploy
+
+Baixar o limite de valor alto para 5.000:
+
+```bash
+curl -X PUT localhost:8080/regras/VALOR_ALTO -H "Content-Type: application/json" \
+  -d '{"tipo":"VALOR_ALTO","limite":5000,"ativa":true}'
+```
+
+Esperar uns 10 segundos e mandar uma transação de 7.000, que antes não geraria alerta:
+
+```bash
+echo 'conta-123|{"eventId":"ev-2","transactionId":"tx-2","accountId":"conta-123","valor":7000.00,"pais":"BR","estabelecimento":"Loja X","dataHora":"2026-11-25T12:01:00Z"}' \
+  | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic transactions \
+    --property parse.key=true --property key.separator='|'
+```
+
+Esperado no log: `SUSPEITA: transação tx-2 quebrou a regra VALOR_ALTO`.
+
+### 2. Notificação fora do ar
+
+```bash
+curl -X PUT localhost:8080/simulacao/notificacao/false
+
+echo 'conta-123|{"eventId":"ev-3","transactionId":"tx-3","accountId":"conta-123","valor":8000.00,"pais":"BR","estabelecimento":"Loja X","dataHora":"2026-11-25T12:02:00Z"}' \
+  | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic transactions \
+    --property parse.key=true --property key.separator='|'
+```
+
+Esperado no log: o motor continua detectando (`SUSPEITA` para tx-3); a notificação tenta 4 vezes e registra `Alerta foi para a DLQ depois de 4 tentativas`. Para conferir a DLQ e religar:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic alerts-dlt --from-beginning --timeout-ms 5000
+
+curl -X PUT localhost:8080/simulacao/notificacao/true
+```
+
+### 3. Mensagem inválida
+
+```bash
+echo 'conta-123|{isso nao e json' \
+  | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic transactions \
+    --property parse.key=true --property key.separator='|'
+
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic transactions-dlt --from-beginning --timeout-ms 5000
+```
+
+Esperado: a mensagem vai direto para a `transactions-dlt`, sem retry, e aparece no consumidor. O `TimeoutException` no fim é só o consumidor parando depois de 5 segundos.
+
+### 4. Idempotência
+
+Mandar de novo exatamente a mesma transação `tx-2` (mesmo `eventId`):
+
+```bash
+echo 'conta-123|{"eventId":"ev-2","transactionId":"tx-2","accountId":"conta-123","valor":7000.00,"pais":"BR","estabelecimento":"Loja X","dataHora":"2026-11-25T12:01:00Z"}' \
+  | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic transactions \
+    --property parse.key=true --property key.separator='|'
+```
+
+Esperado no log: o evento é registrado como já processado e ignorado; não há novo `SUSPEITA` nem nova notificação.
 
 ## Requisitos do case
 
@@ -127,8 +196,8 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 - **Unitários (JUnit 5 + Mockito):** 27 testes cobrindo regras (incluindo o limite exato), idempotência, listener (publica só quando suspeita, ignora evento concluído, falha em vez de perder evento interrompido, não esconde o erro original, rejeita evento sem `eventId` ou sem `transactionId`), cache de regras (Postgres fora do ar, tipo inválido) e notificação (não reenvia alerta repetido). Os demais campos obrigatórios são validados no código, mas ainda sem teste.
 - **Cobertura (JaCoCo):** cerca de 77% das instruções e 76% dos desvios nos unitários. Ficaram sem cobertura os controllers, a classe main, o `AlertaPublisher` e o `KafkaConfig`, que pedem testes de integração.
-- **Testes manuais de ponta a ponta:** os roteiros da seção Demonstrações.
-- **Revisão com agentes de IA:** quatro rodadas (a quarta só conferiu a documentação), com os relatórios em `docs/revisao-ia/`. Ver `AI_USAGE.md`.
+- **Testes manuais de ponta a ponta:** os roteiros da seção Demonstrações, executados com Kafka, Redis e Postgres reais.
+- **Revisão com agentes de IA:** quatro rodadas (a quarta só conferiu a documentação), com os relatórios em `docs/revisao-ia/`. Ver [AI_USAGE.md](AI_USAGE.md).
 - **Análise estática:** SpotBugs e PMD foram testados e retirados (falsos positivos e incompatibilidade com o JDK 25 do ambiente). Fica como evolução.
 - **Próximos:** integração com Testcontainers ou `@EmbeddedKafka`, testes de ordem (publicar antes de concluir) e teste de carga com k6 ou Gatling.
 
@@ -155,6 +224,7 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 - O tópico `alerts` pode receber o mesmo alerta mais de uma vez; a notificação descarta repetidos, mas a verificação não é atômica, e outros consumidores precisam deduplicar pelo `alertaId`.
 - O cache de regras começa vazio: eventos consumidos antes da primeira carga são concluídos sem avaliação.
 - A API de regras não tem autenticação nem validação de entrada. Uma regra VALOR_ALTO sem limite faz toda transação falhar e ir para a `transactions-dlt`. Uma regra com tipo inválido, ou FREQUENCIA com campo nulo, impede a recarga de todas as regras: o cache fica na última versão válida e o log atribui o erro ao Postgres.
+- Os tópicos de retry da notificação são criados com menos partições que o `alerts`; o Kafka redistribui (aparece um aviso no log) e o retry funciona, mas o ideal é criá-los com o mesmo número de partições.
 - Tópicos com fator de replicação 1 fixo no código; a regra de frequência faz 4 comandos não atômicos no Redis; o `/simulacao` não está restrito a um perfil de demo.
 - A notificação não tem circuit breaker.
 
@@ -164,7 +234,7 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 2. Notificação como serviço separado, com deduplicação atômica própria e que continue enviando com o Redis fora.
 3. Teste de carga para provar 8k/25k TPS e métrica de latência ponta a ponta com painel no Grafana.
 4. Carregar as regras antes de começar a consumir; validar a API e tornar o PUT parcial seguro.
-5. Partições e replicação por ambiente, com tópicos criados pela plataforma.
+5. Partições e replicação por ambiente, com tópicos (incluindo os de retry) criados pela plataforma.
 6. Regra de frequência atômica com script Lua; circuit breaker (Resilience4j).
 7. Novas regras (localização impossível, regra composta) e deploy em Kubernetes com autoscaling pelo lag.
 
