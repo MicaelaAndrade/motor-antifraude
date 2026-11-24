@@ -170,4 +170,4 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 ## Uso de IA
 
-Detalhado em [AI_USAGE.md] (`AI_USAGE.md`).
+Detalhado em [AI_USAGE.md](AI_USAGE.md).
