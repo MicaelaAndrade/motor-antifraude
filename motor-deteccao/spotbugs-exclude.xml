@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<FindBugsFilter>
-    <!-- Injeção de dependência do Spring: guardar o bean recebido no construtor é esperado -->
-    <Match>
-        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
-    </Match>
-</FindBugsFilter>
