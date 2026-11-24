@@ -6,14 +6,28 @@ O motor recebe eventos de transações em tempo real pelo Kafka, aplica regras d
 
 ## Arquitetura
 
-Diagrama: `docs/arquitetura-motor-antifraude.drawio` (abre no draw.io).
+Diagrama da arquitetura-alvo: `docs/arquitetura-motor-antifraude.drawio` (abre no draw.io). O esquema abaixo mostra o que está implementado; circuit breaker, base de clientes e o bloco de segurança do diagrama ainda são proposta.
 
+```mermaid
+flowchart LR
+    SI[Serviço interno do banco] -->|transação, chave accountId| T[(Kafka: transactions)]
+    T --> M[Motor de Detecção]
+    M <-->|idempotência e janela de frequência| R[(Redis)]
+    API[API de Regras] -->|PUT /regras| PG[(Postgres: regra_config)]
+    PG -->|recarga a cada 10 s| M
+    M -->|erro de dado ou falha| TD[(Kafka: transactions-dlt)]
+    M -->|alerta, chave accountId| A[(Kafka: alerts)]
+    A --> AI[Antifraude interno - externo]
+    A --> N[Notificação push / e-mail]
+    N <-->|alertas já notificados| R
+    N -->|falha| AR[(Kafka: tópicos de retry)]
+    AR --> N
+    N -->|após 4 tentativas| AD[(Kafka: alerts-dlt)]
+    M -.->|/actuator/prometheus| P[Prometheus]
+    P -.-> G[Grafana]
 ```
-Serviço interno → [transactions] → Motor de Detecção → [alerts] → Antifraude interno (consumidor externo, fora do escopo)
-                         │           │        │               └→ Notificação (push/e-mail) → [alerts-retry-*] → [alerts-dlt]
-                         │         Redis   Postgres
-                         └→ [transactions-dlt]
-```
+
+Setas cheias são o fluxo dos dados; setas tracejadas, as métricas.
 
 - **Kafka, tópico `transactions`** (24 partições): o contrato esperado do produtor é usar `accountId` como chave, para que as transações de uma conta fiquem na mesma partição, em ordem.
 - **Motor (Java 21, Spring Boot 4.2):** valida o evento, checa idempotência, aplica as regras ativas e publica o alerta.
@@ -21,7 +35,8 @@ Serviço interno → [transactions] → Motor de Detecção → [alerts] → Ant
 - **Postgres:** cadastro das regras (tabela `regra_config`).
 - **Kafka, tópico `alerts`** (chave `accountId`): desacopla a detecção de quem consome o alerta. O `alertaId` é a chave de idempotência que todo consumidor deve usar.
 - **Notificação:** consome `alerts` com retry em tópicos e DLQ (`alerts-dlt`), e descarta alertas já notificados.
-- **Prometheus + Grafana:** coletam as métricas do motor em `/actuator/prometheus`.
+- **Prometheus:** coleta as métricas do motor em `/actuator/prometheus`.
+- **Grafana:** sobe sem datasource nem painel; precisa ser apontado ao Prometheus manualmente.
 
 ## Como rodar
 
@@ -90,15 +105,15 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 | Idempotência | Feito | Dois estados no Redis por `eventId` (em processamento e concluído); notificação descarta `alertaId` repetido |
 | Regras sem redeploy | Parcial | Parâmetros e ativação mudam em tempo real; um tipo novo de regra exige deploy |
 | 8.000 TPS / pico 25.000 | Proposto | Arquitetura particionada para escalar horizontalmente; não medido |
-| Alerta em até 500 ms | Proposto | Regras em memória, sem banco por transação; falta métrica de ponta a ponta |
+| Alerta em até 500 ms | Proposto | Regras em memória, sem consulta ao Postgres por transação; falta métrica de ponta a ponta |
 | Segurança e LGPD | Parcial | Ver seção Segurança |
-| Observabilidade | Parcial | Métricas coletadas pelo Prometheus; faltam a métrica de latência e os alertas |
+| Observabilidade | Parcial | Métricas coletadas pelo Prometheus; faltam a métrica de latência, o painel e os alertas |
 
 ## Decisões técnicas e trade-offs
 
 **Kafka em vez de RabbitMQ.** Minha experiência anterior é com RabbitMQ. Escolhi Kafka porque o case pede vazão alta e ordem por conta: com o `accountId` como chave, as regras com estado veem as transações de uma conta em ordem; o log retido permite reprocessar; e vários consumidores leem o mesmo alerta. Custo: operar Kafka é mais complexo.
 
-**Regras como dados.** Cada regra é uma linha no Postgres; o motor relê as regras ativas a cada 10 segundos e guarda em memória. Nenhuma transação consulta o banco, o que protege a latência, e uma queda do Postgres depois da subida não para a detecção. Trade-off: uma mudança leva até 10 segundos para valer. Cada tipo de regra implementa a interface `Regra`; um tipo novo exige a classe e uma linha no `RegraCache`, com deploy.
+**Regras como dados.** Cada regra é uma linha no Postgres; o motor relê as regras ativas a cada 10 segundos e guarda em memória. Nenhuma transação consulta o Postgres, o que protege a latência, e uma queda do Postgres depois da subida não para a detecção. Trade-off: uma mudança leva até 10 segundos para valer. Cada tipo de regra implementa a interface `Regra`; um tipo novo exige a classe e uma linha no `RegraCache`, com deploy.
 
 **Idempotência em dois estados.** Ao chegar, o evento recebe a marca "em processamento" no Redis (`SETNX`, TTL de 5 min). Só depois de publicar todos os alertas ele vira "concluído" (TTL de 24 h). Se o processamento falhar com exceção, a marca é apagada para a nova tentativa. Se o processo cair no meio, a marca fica até expirar e o evento vai para a DLQ, em vez de ser perdido em silêncio. O `alertaId` (`transactionId:regraId`) é estável e a notificação o usa para não notificar duas vezes.
 
@@ -110,16 +125,16 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 
 ## Estratégia de testes
 
-- **Unitários (JUnit 5 + Mockito):** regras (incluindo o limite exato), idempotência, listener (publica só quando suspeita, ignora evento concluído, falha em vez de perder evento interrompido, não esconde o erro original, rejeita campos obrigatórios vazios), cache de regras (Postgres fora do ar, tipo inválido) e notificação (não reenvia alerta repetido).
-- **Cobertura (JaCoCo):** cerca de 76% das instruções e 73% dos desvios nos unitários. Ficaram sem cobertura os controllers, a classe main, o `AlertaPublisher` e o `KafkaConfig`, que pedem testes de integração.
+- **Unitários (JUnit 5 + Mockito):** regras (incluindo o limite exato), idempotência, listener (publica só quando suspeita, ignora evento concluído, falha em vez de perder evento interrompido, não esconde o erro original, rejeita evento sem `eventId` ou sem `transactionId`), cache de regras (Postgres fora do ar, tipo inválido) e notificação (não reenvia alerta repetido). Os demais campos obrigatórios são validados no código, mas ainda sem teste.
+- **Cobertura (JaCoCo):** cerca de 76% das instruções e 74% dos desvios nos unitários. Ficaram sem cobertura os controllers, a classe main, o `AlertaPublisher` e o `KafkaConfig`, que pedem testes de integração.
 - **Testes manuais de ponta a ponta:** os roteiros da seção Demonstrações.
-- **Revisão com agentes de IA:** três rodadas, com os relatórios em `docs/revisao-ia/`. Ver `AI_USAGE.md`.
+- **Revisão com agentes de IA:** quatro rodadas (a quarta só conferiu a documentação), com os relatórios em `docs/revisao-ia/`. Ver `AI_USAGE.md`.
 - **Análise estática:** SpotBugs e PMD foram testados e retirados (falsos positivos e incompatibilidade com o JDK 25 do ambiente). Fica como evolução.
 - **Próximos:** integração com Testcontainers ou `@EmbeddedKafka`, testes de ordem (publicar antes de concluir) e teste de carga com k6 ou Gatling.
 
 ## Segurança e LGPD
 
-- **Feito:** os logs do motor e da notificação não trazem `accountId` nem valores; a DLT da notificação não registra o payload.
+- **Feito:** os logs do motor e da notificação não trazem `accountId` nem valores; a DLT da notificação não registra o payload. Mensagens de erro do framework para JSON malformado podem incluir o trecho rejeitado.
 - **Em trânsito (proposta):** TLS no Kafka, Redis e Postgres; mTLS entre serviços.
 - **Autenticação (proposta):** API de regras atrás de OAuth2/JWT, com perfil de acesso para o time antifraude e auditoria de cada mudança.
 - **Em repouso (proposta):** discos e backups criptografados; segredos fora do repositório (hoje a senha local está no `application.properties`, aceitável só em desenvolvimento).
@@ -134,12 +149,12 @@ Um `./mvnw test` sem filtro também roda o `contextLoads`, que precisa da infrae
 ## Limitações conhecidas
 
 - Vazão e latência não foram medidas.
-- Ninguém consome nem reprocessa `transactions-dlt` e `alerts-dlt`: o que cai lá precisa de replay manual.
+- Ninguém reprocessa `transactions-dlt` e `alerts-dlt` (a `alerts-dlt` só gera um log de erro): o que cai lá precisa de replay manual.
 - Se o motor cair no meio de um evento, a nova entrega encontra a marca "em processamento" e o evento vai para a DLQ, porque o retry (cerca de 3 s) é mais curto que o TTL da marca (5 min).
 - O Redis é ponto único de falha: fora do ar, transações e notificações vão para as DLQs.
 - O tópico `alerts` pode receber o mesmo alerta mais de uma vez; a notificação descarta repetidos, mas a verificação não é atômica, e outros consumidores precisam deduplicar pelo `alertaId`.
 - O cache de regras começa vazio: eventos consumidos antes da primeira carga são concluídos sem avaliação.
-- A API de regras não tem autenticação nem validação de entrada; uma regra com campo nulo pode derrubar a detecção.
+- A API de regras não tem autenticação nem validação de entrada. Uma regra VALOR_ALTO sem limite faz toda transação falhar e ir para a `transactions-dlt`. Uma regra com tipo inválido, ou FREQUENCIA com campo nulo, impede a recarga de todas as regras: o cache fica na última versão válida e o log atribui o erro ao Postgres.
 - Tópicos com fator de replicação 1 fixo no código; a regra de frequência faz 4 comandos não atômicos no Redis; o `/simulacao` não está restrito a um perfil de demo.
 - A notificação não tem circuit breaker.
 

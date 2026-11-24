@@ -90,7 +90,7 @@ class TransacaoListenerTest {
     }
 
     @Test
-    void liberaENãoConcluiQuandoPublicacaoFalha() {
+    void liberaENaoConcluiQuandoPublicacaoFalha() {
         when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.NOVO);
         when(regra.ehSuspeita(transacao)).thenReturn(true);
         doThrow(new IllegalStateException("broker fora")).when(publisher).publicar(any(Alerta.class));
@@ -115,12 +115,22 @@ class TransacaoListenerTest {
     }
 
     @Test
-    void eventoSemTransactionIdEhInvalido() {
+    void eventoSemIdEhInvalido() {
         Transacao semId = new Transacao(null, "tx-2", "conta-1",
                 new BigDecimal("10"), "BR", "Loja", Instant.now());
         when(objectMapper.readValue("sem-id", Transacao.class)).thenReturn(semId);
 
         assertThrows(EventoInvalidoException.class, () -> listener.consumir("sem-id"));
+        verify(idempotencia, never()).iniciar(anyString());
+    }
+
+    @Test
+    void eventoSemTransactionIdEhInvalido() {
+        Transacao semTransactionId = new Transacao("ev-2", null, "conta-1",
+                new BigDecimal("10"), "BR", "Loja", Instant.now());
+        when(objectMapper.readValue("sem-tx", Transacao.class)).thenReturn(semTransactionId);
+
+        assertThrows(EventoInvalidoException.class, () -> listener.consumir("sem-tx"));
         verify(idempotencia, never()).iniciar(anyString());
     }
 }
