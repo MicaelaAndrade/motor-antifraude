@@ -32,14 +32,16 @@ public class TransacaoListener {
     @KafkaListener(topics = "transactions")
     public void consumir(String mensagem) {
         Transacao transacao = objectMapper.readValue(mensagem, Transacao.class);
+        validar(transacao);
+        String eventId = transacao.eventId();
 
-        if (transacao.eventId() == null || transacao.eventId().isBlank()) {
-            throw new IllegalArgumentException("Evento sem eventId");
-        }
-
-        if (!idempotencia.registrar(transacao.eventId())) {
-            log.info("Evento {} duplicado, ignorado", transacao.eventId());
-            return;
+        switch (idempotencia.iniciar(eventId)) {
+            case CONCLUIDO -> {
+                log.info("Evento {} já processado, ignorado", eventId);
+                return;
+            }
+            case EM_PROCESSAMENTO -> throw new EventoEmProcessamentoException(eventId);
+            case NOVO -> { }
         }
 
         try {
@@ -50,9 +52,23 @@ public class TransacaoListener {
                     publisher.publicar(Alerta.de(transacao, regra.id()));
                 }
             }
-        } catch (RuntimeException e) {
-            idempotencia.liberar(transacao.eventId());
+            idempotencia.concluir(eventId);
+        } catch (RuntimeException | Error e) {
+            try {
+                idempotencia.liberar(eventId);
+            } catch (RuntimeException falhaAoLiberar) {
+                e.addSuppressed(falhaAoLiberar);
+            }
             throw e;
+        }
+    }
+
+    private void validar(Transacao t) {
+        if (t == null || t.eventId() == null || t.eventId().isBlank()) {
+            throw new EventoInvalidoException("Evento sem eventId");
+        }
+        if (t.valor() == null || t.dataHora() == null || t.accountId() == null) {
+            throw new EventoInvalidoException("Evento " + t.eventId() + " com campo obrigatório vazio");
         }
     }
 }

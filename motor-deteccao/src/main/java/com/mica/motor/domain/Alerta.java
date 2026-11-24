@@ -12,9 +12,10 @@ public record Alerta(
         Instant geradoEm
 ) {
     public static Alerta de(Transacao t, String regraId) {
+        // usa a hora da transação: o mesmo alerta tem sempre o mesmo conteúdo
         return new Alerta(
                 t.transactionId() + ":" + regraId,
                 t.transactionId(), t.accountId(), regraId,
-                t.valor(), Instant.now());
+                t.valor(), t.dataHora());
     }
 }

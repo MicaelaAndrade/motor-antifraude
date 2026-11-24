@@ -1,7 +1,9 @@
 package com.mica.motor.kafka;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -11,6 +13,7 @@ import static org.mockito.Mockito.when;
 import com.mica.motor.domain.Alerta;
 import com.mica.motor.domain.Transacao;
 import com.mica.motor.idempotencia.IdempotenciaService;
+import com.mica.motor.idempotencia.IdempotenciaService.Inicio;
 import com.mica.motor.regras.Regra;
 import com.mica.motor.regras.RegraCache;
 import java.math.BigDecimal;
@@ -25,19 +28,18 @@ class TransacaoListenerTest {
     private ObjectMapper objectMapper;
     private IdempotenciaService idempotencia;
     private AlertaPublisher publisher;
-    private RegraCache regraCache;
     private Regra regra;
     private TransacaoListener listener;
 
     private final Transacao transacao = new Transacao("ev-1", "tx-1", "conta-1",
-            new BigDecimal("20000"), "BR", "Loja", Instant.now());
+            new BigDecimal("20000"), "BR", "Loja", Instant.parse("2026-11-25T12:00:00Z"));
 
     @BeforeEach
     void setUp() {
         objectMapper = mock(ObjectMapper.class);
         idempotencia = mock(IdempotenciaService.class);
         publisher = mock(AlertaPublisher.class);
-        regraCache = mock(RegraCache.class);
+        RegraCache regraCache = mock(RegraCache.class);
         regra = mock(Regra.class);
 
         when(objectMapper.readValue("json", Transacao.class)).thenReturn(transacao);
@@ -48,28 +50,30 @@ class TransacaoListenerTest {
     }
 
     @Test
-    void publicaAlertaQuandoSuspeita() {
-        when(idempotencia.registrar("ev-1")).thenReturn(true);
+    void publicaAlertaEConcluiQuandoSuspeita() {
+        when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.NOVO);
         when(regra.ehSuspeita(transacao)).thenReturn(true);
 
         listener.consumir("json");
 
         verify(publisher).publicar(any(Alerta.class));
+        verify(idempotencia).concluir("ev-1");
     }
 
     @Test
-    void naoPublicaQuandoNaoSuspeita() {
-        when(idempotencia.registrar("ev-1")).thenReturn(true);
+    void naoPublicaQuandoNaoSuspeitaMasConclui() {
+        when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.NOVO);
         when(regra.ehSuspeita(transacao)).thenReturn(false);
 
         listener.consumir("json");
 
         verify(publisher, never()).publicar(any(Alerta.class));
+        verify(idempotencia).concluir("ev-1");
     }
 
     @Test
-    void ignoraEventoDuplicado() {
-        when(idempotencia.registrar("ev-1")).thenReturn(false);
+    void ignoraEventoJaConcluido() {
+        when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.CONCLUIDO);
 
         listener.consumir("json");
 
@@ -78,14 +82,45 @@ class TransacaoListenerTest {
     }
 
     @Test
-    void liberaIdempotenciaQuandoPublicacaoFalha() {
-        when(idempotencia.registrar("ev-1")).thenReturn(true);
+    void eventoPelaMetadeFalhaEmVezDeSumir() {
+        when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.EM_PROCESSAMENTO);
+
+        assertThrows(EventoEmProcessamentoException.class, () -> listener.consumir("json"));
+        verify(publisher, never()).publicar(any(Alerta.class));
+    }
+
+    @Test
+    void liberaENãoConcluiQuandoPublicacaoFalha() {
+        when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.NOVO);
         when(regra.ehSuspeita(transacao)).thenReturn(true);
-        doThrow(new IllegalStateException("broker fora"))
-                .when(publisher).publicar(any(Alerta.class));
+        doThrow(new IllegalStateException("broker fora")).when(publisher).publicar(any(Alerta.class));
 
         assertThrows(IllegalStateException.class, () -> listener.consumir("json"));
 
         verify(idempotencia).liberar("ev-1");
+        verify(idempotencia, never()).concluir(anyString());
+    }
+
+    @Test
+    void falhaAoLiberarNaoEscondeOErroOriginal() {
+        when(idempotencia.iniciar("ev-1")).thenReturn(Inicio.NOVO);
+        when(regra.ehSuspeita(transacao)).thenReturn(true);
+        doThrow(new IllegalStateException("broker fora")).when(publisher).publicar(any(Alerta.class));
+        doThrow(new RuntimeException("redis fora")).when(idempotencia).liberar("ev-1");
+
+        IllegalStateException erro = assertThrows(IllegalStateException.class, () -> listener.consumir("json"));
+
+        assertEquals("broker fora", erro.getMessage());
+        assertEquals(1, erro.getSuppressed().length);
+    }
+
+    @Test
+    void eventoSemIdEhInvalido() {
+        Transacao semId = new Transacao(null, "tx-2", "conta-1",
+                new BigDecimal("10"), "BR", "Loja", Instant.now());
+        when(objectMapper.readValue("sem-id", Transacao.class)).thenReturn(semId);
+
+        assertThrows(EventoInvalidoException.class, () -> listener.consumir("sem-id"));
+        verify(idempotencia, never()).iniciar(anyString());
     }
 }
